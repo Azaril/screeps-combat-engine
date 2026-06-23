@@ -1,54 +1,32 @@
 # screeps-combat-engine
 
-A **deterministic, JS-free port of the Screeps combat tick** — the *mechanism* layer of the combat
-micro-simulator (ADR [0006](https://github.com/Azaril/screeps-ibex/blob/master/docs/design/0006-eval-and-iteration-harness.md) Part B). It models a
-single 50×50 room of creeps + structures and resolves combat **exactly as the real Screeps engine
-does**, so the bot's own combat decision code can be exercised against it in milliseconds —
-deterministically, with full introspection, no Docker, no server, no JavaScript.
+> A deterministic, JS-free Rust port of the Screeps combat tick.
 
-> **Why this exists.** Combat in Screeps is unmeasurable on a live server (concurrent ticks,
-> non-reproducible, minutes per run). This crate lets us iterate on squad tactics
-> (ADR [0008](https://github.com/Azaril/screeps-ibex/blob/master/docs/design/0008-combat-and-squad-architecture.md) /
-> [0008a](https://github.com/Azaril/screeps-ibex/blob/master/docs/design/0008a-combat-tactics.md)) with `cargo test`-speed turnaround and exact,
-> seed-reproducible outcomes — the harness-first foundation of the combat overhaul (phase
-> [P2.H1](https://github.com/Azaril/screeps-ibex/blob/master/docs/execution/phase-2.md)). The Dockerized private server stays as the *fidelity
-> oracle*; this is the *per-change loop*.
+`screeps-combat-engine` models a single 50×50 Screeps room of creeps and structures and resolves
+combat **exactly as the real Screeps engine does** — damage, healing, movement, towers, ramparts,
+deaths — in microseconds, deterministically, with no Docker, no server, and no JavaScript. It is the
+*mechanism* layer of a combat micro-simulator: hand it a world plus per-creep intents and it returns
+the resolved next tick, with an optional per-tick recording for introspection. It was extracted from
+the [screeps-ibex](https://github.com/Azaril/screeps-ibex) workspace.
 
-## How it was built (provenance)
+## Why it exists
 
-This is a **hand-port from a local clone of the [screeps-engine](https://github.com/screeps/engine)
-source** — **not** from documentation, and **not** machine-generated. Every formula cites the engine file + lines it ports
-(in its doc comment), and is pinned by host conformance tests against hand-computed engine values.
+Combat in Screeps is hard to measure on a live server: ticks run concurrently, outcomes are not
+reproducible, and a single engagement takes minutes. This crate makes combat a pure function —
+identical `(world, intents)` always produce an identical result — so combat code and tactics can be
+iterated at `cargo test` speed with exact, seed-reproducible outcomes. A live (e.g. Dockerized)
+private server stays the fidelity oracle; this crate is the fast per-change loop.
 
-It was ported against:
+## Installation
 
-| Source | Pinned version |
-|---|---|
-| `screeps-engine` | `8097782` — package **v4.3.2** (2026-06-01) |
-| `screeps-common` (constants) | `2fb779b` (2026-04-19) |
-| `screeps-game-api` (value types) | `0a8dd78` / crate `0.23.1` |
+```toml
+[dependencies]
+screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
+```
 
-**When the engine updates, follow the reconciliation procedure in [`AGENTS.md`](AGENTS.md)** — it
-carries the full engine→code source map and the step-by-step re-verify checklist. That file is the
-first thing to read before changing any formula here.
-
-## Status (P2.H1, in progress)
-
-- **Done:** the combat-math kernel (`constants`, `body`, `damage`); the full **two-phase tick**
-  (`resolve`: combat accumulate → movement → apply + damage-then-heal netting + deaths);
-  **movement-conflict resolution** (`movement`: eligibility/fatigue, swap + moves/weight tiebreak,
-  obstacle + chain-block, **pull** rate2/rate3 for no-MOVE/under-MOVE comps); **structures**
-  (`state`: ramparts/walls/spawn **and towers** as attack/dismantle/RMA targets with rampart
-  RMA-shielding; towers fire heal/repair/attack *and* are themselves targetable + repairable); and
-  **`CombatRecording`** (`record`: the per-tick replay artifact — state + intents + reason tags +
-  outcomes — for the "see WHY" introspection, with a deterministic text scrubber). **40 host
-  conformance tests** — kill inequality, focus-fire, tower drain, safe mode, attack-back
-  (EXP-FOUND-1/EXP-FOCUS-1); range-3 kiting at MOVE parity (EXP-KITE-1); wall-breach, spawn-kill,
-  rampart-shield, tower-heal, tower-repair-vs-dismantle, tower-as-target (EXP-BREACH/EXP-DEF); pull
-  (drag a no-MOVE creep); recording capture/replay. Host + wasm32 compile; clippy-clean.
-- **Next:** the **server-captured golden vectors** that mark P2.H1 *done* (byte-exact vs the live
-  engine). Then P2.H2 — the `CombatView`/`CombatIntent` trait seam so the bot's real decision code
-  drives the sim (self-play).
+It depends only on the value types from [`screeps-game-api`](https://crates.io/crates/screeps-game-api)
+(`Part`, `Position`, `RoomName`, …) — no JS interop — so it builds for both host (`cargo test`) and
+`wasm32-unknown-unknown`.
 
 ## Quick start
 
@@ -78,51 +56,62 @@ let report = resolve_tick(&mut world, &intents);
 
 Run the conformance tests:
 
+```bash
+cargo test -p screeps-combat-engine
+cargo check -p screeps-combat-engine --target wasm32-unknown-unknown
 ```
-cargo test -p screeps-combat-engine        # host (the `test-host` lane)
-cargo check -p screeps-combat-engine --target wasm32-unknown-unknown   # dual-target rule
-```
+
+## What it models
+
+- **Combat math** — per-part 100-hit pools with back-to-front degradation, boost-aware part power,
+  and TOUGH/boost damage reduction; ranged-mass-attack distance falloff and tower output falloff.
+- **The two-phase tick** — intent accumulation → movement → apply, with damage-then-heal netting and
+  deaths.
+- **Movement-conflict resolution** — eligibility/fatigue, swaps, the moves/weight tiebreak, obstacle
+  and chain blocking, and `pull` for no-MOVE / under-MOVE compositions.
+- **Structures** — ramparts, walls, spawns, and towers (which fire heal/repair/attack and are
+  themselves targetable and repairable), with rampart damage-redirection and safe mode.
+- **Recording** — an optional per-tick replay artifact (state + intents + reason tags + outcomes)
+  with a deterministic text scrubber, for "see why it happened" introspection.
+
+Every formula is a hand-port from a local clone of the
+[screeps-engine](https://github.com/screeps/engine) source — not from documentation, not
+machine-generated. Each cites the engine file and lines it ports in its doc comment, and is pinned by
+host conformance tests against hand-computed engine values. The current port matches:
+
+| Source | Pinned version |
+|---|---|
+| `screeps-engine` | `8097782` — v4.3.2 (2026-06-01) |
+| `screeps-common` (constants) | `2fb779b` (2026-04-19) |
+| `screeps-game-api` (value types) | `0.23.1` |
+
+> Contributors: when the upstream engine changes, see [`AGENTS.md`](AGENTS.md) for the engine→port
+> source map and the re-verification checklist.
 
 ## Modules
 
 | Module | What it is |
 |---|---|
-| [`constants`](src/constants.rs) | Combat constants (powers, ranges, RMA + tower falloff, fatigue) transcribed from the engine. |
+| [`constants`](src/constants.rs) | Combat constants (powers, ranges, ranged-mass-attack + tower falloff, fatigue) transcribed from the engine. |
 | [`body`](src/body.rs) | The body model: per-part 100-hit pools, back-to-front degradation (`_recalc-body`), boost-aware power (`calcBodyEffectiveness`), and the TOUGH/boost damage reduction (`_applyDamage`). |
-| [`damage`](src/damage.rs) | Range-dependent formulas: rangedMassAttack distance falloff + tower output falloff (kept identical to the bot kernel `military/damage.rs`). |
-| [`state`](src/state.rs) | `CombatWorld` / `SimCreep` / `SimTower` value types (JS-free, over `screeps::Position`). |
+| [`damage`](src/damage.rs) | Range-dependent formulas: ranged-mass-attack distance falloff and tower output falloff. |
+| [`state`](src/state.rs) | The `CombatWorld` / `SimCreep` / `SimTower` value types (JS-free, over `screeps::Position`). |
 | [`resolve`](src/resolve.rs) | The two-phase tick: intent priority/exclusion → per-target pooling → damage-then-heal netting → deaths → fatigue regen. |
-
-## Where it fits
-
-```
-screeps-combat-engine    (this crate — MECHANISM: the exact combat tick)
-screeps-combat-decision  (TACTICS/SEAM: CombatView/CombatIntent + the bot's REAL decisions —
-                          select_focus_target / decide_combat; a member crate the live bot AND the
-                          sim both depend on, so there is one implementation, no fork)
-        ▲ both used by
-screeps-combat-agent     (P2.H2 — sim glue: builds a CombatView from a CombatWorld and runs the
-                          bot's IbexAgent over it → self-play. Depends only on engine + decision,
-                          NOT the whole bot)
-        ▲ used by
-screeps-combat-eval      (P2.H4, planned — POLICY: scenarios, cohesion metrics, scoring,
-                          sim-vs-server parity, replay)
-```
-
-- The bot kernel `military/damage.rs` is a *sizing heuristic*; this crate is *exact tick
-  resolution*. They are kept identical on the tower falloff so sim and live never disagree.
-- Fidelity is bounded against the Dockerized private server (the oracle) via conformance golden
-  vectors (per-change) and a nightly parity report (ADR 0006 Part B §4).
 
 ## Determinism
 
 No RNG, no wall-clock, no network. Outcomes never depend on `HashMap` iteration order — creeps are
 processed in `CombatWorld::creeps` order and per-target pools are keyed by creep id. Identical
-`(CombatWorld, Intents)` ⇒ identical result, every time. This is what makes the N-seed combat gates
-(ADR 0015) buildable.
+`(CombatWorld, Intents)` ⇒ identical result, every time — which is what makes seed-based combat gates
+buildable.
 
-## A workspace member, not excluded
+## Related crates
 
-Pure logic over `screeps-game-api` value types (the `screeps-rover` / `screeps-foreman` profile),
-no host-only deps — so it is a workspace **member** that builds both targets and inherits the
-workspace `screeps-game-api` patch. (ADR 0006 §B.1 originally said "excluded"; corrected there.)
+This is the lowest layer of a four-crate combat stack (engine → decision → agent → eval):
+
+- [screeps-combat-decision](https://github.com/Azaril/screeps-combat-decision) — the tactical seam +
+  pure combat decisions, shared by the live bot and the sim so there is one implementation.
+- [screeps-combat-agent](https://github.com/Azaril/screeps-combat-agent) — the sim harness: runs real
+  decision code over this engine for self-play.
+- [screeps-combat-eval](https://github.com/Azaril/screeps-combat-eval) — the policy layer: a
+  metric-producing experiment register over the sim.
