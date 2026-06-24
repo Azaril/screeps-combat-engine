@@ -31,6 +31,10 @@ pub struct CreepFrame {
     pub attack_power: u32,
     /// Working **ranged** attack output this tick (0 ⇒ no live RANGED_ATTACK parts).
     pub ranged_power: u32,
+    /// Alive part counts by type — `[TOUGH, ATTACK, RANGED_ATTACK, WORK, CARRY, HEAL, MOVE]` — so a
+    /// replay can show each creep's composition (tankiness = TOUGH/total; role = the mix) + its live
+    /// degradation. Raw counts, not boost-weighted.
+    pub composition: [u32; 7],
 }
 
 /// A structure's state at the start of a recorded tick.
@@ -192,6 +196,15 @@ pub fn record_tick(
             fatigue: c.fatigue,
             attack_power: c.body.attack_power(),
             ranged_power: c.body.ranged_attack_power(),
+            composition: [
+                c.body.alive_part_count(screeps::Part::Tough),
+                c.body.alive_part_count(screeps::Part::Attack),
+                c.body.alive_part_count(screeps::Part::RangedAttack),
+                c.body.alive_part_count(screeps::Part::Work),
+                c.body.alive_part_count(screeps::Part::Carry),
+                c.body.alive_part_count(screeps::Part::Heal),
+                c.body.alive_part_count(screeps::Part::Move),
+            ],
         })
         .collect();
     let structures: Vec<StructureFrame> = world

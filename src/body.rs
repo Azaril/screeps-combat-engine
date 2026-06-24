@@ -138,6 +138,12 @@ impl SimBody {
         self.effective_power(Part::Work, DISMANTLE_POWER)
     }
 
+    /// Count of ALIVE (`hits > 0`) parts of `part_type` — the raw, un-boost-weighted count (for replay
+    /// composition display: "this creep is 8×TOUGH + 25×WORK"). Degrades as front parts are destroyed.
+    pub fn alive_part_count(&self, part_type: Part) -> u32 {
+        self.parts.iter().enumerate().filter(|(i, p)| p.part == part_type && self.part_hits(*i) > 0).count() as u32
+    }
+
     /// `calcBodyEffectiveness(body, MOVE, 'fatigue', 1)` — the boost-weighted count of alive MOVE
     /// parts (the movement tiebreak's numerator, `movement.js:118`).
     pub fn move_rate(&self) -> u32 {
