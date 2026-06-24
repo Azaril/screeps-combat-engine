@@ -3,8 +3,8 @@
 
 use crate::body::SimBody;
 use crate::constants::{FATIGUE_RATE_PLAIN, FATIGUE_RATE_SWAMP};
-use screeps::Position;
-use std::collections::HashSet;
+use screeps::{Position, RoomName};
+use std::collections::{HashMap, HashSet};
 
 /// Room terrain — defaults to all-plain. Walls block movement; swamp raises move fatigue.
 /// (Roads, which lower fatigue, are structures and arrive with the structures slice.)
@@ -111,7 +111,14 @@ impl SimTower {
 #[derive(Clone, Debug, Default)]
 pub struct CombatWorld {
     pub tick: u32,
+    /// The default/common room terrain — also the terrain of a single-room scenario. Per-room
+    /// overrides for a multi-room scenario live in [`rooms`](CombatWorld::rooms); read terrain via
+    /// [`terrain_for`](CombatWorld::terrain_for), which falls back to this for any room without an
+    /// override. (S1: keeps single-room builders unchanged while the engine becomes room-aware.)
     pub terrain: CombatTerrain,
+    /// Per-room terrain overrides for multi-room scenarios (N-room sim, ADR 0023). A room absent here
+    /// uses [`terrain`](CombatWorld::terrain).
+    pub rooms: HashMap<RoomName, CombatTerrain>,
     pub creeps: Vec<SimCreep>,
     pub towers: Vec<SimTower>,
     pub structures: Vec<SimStructure>,
@@ -122,6 +129,18 @@ pub struct CombatWorld {
 impl CombatWorld {
     pub fn living_creeps(&self) -> impl Iterator<Item = &SimCreep> {
         self.creeps.iter().filter(|c| c.is_alive())
+    }
+
+    /// Terrain for `room` — the per-room override if one exists, else the default [`terrain`](CombatWorld::terrain).
+    /// All movement/fatigue/wall checks go through this so the engine is multi-room-correct (ADR 0023 S1).
+    pub fn terrain_for(&self, room: RoomName) -> &CombatTerrain {
+        self.rooms.get(&room).unwrap_or(&self.terrain)
+    }
+
+    /// Mutable per-room terrain override for `room` (creating an empty one if absent) — used by the
+    /// multi-room ScenarioBuilder to give distinct rooms distinct terrain.
+    pub fn terrain_mut(&mut self, room: RoomName) -> &mut CombatTerrain {
+        self.rooms.entry(room).or_default()
     }
     /// Is there a living rampart on this tile? (rangedMassAttack skips non-rampart targets here,
     /// and an attacker standing here deals no melee attack-back.)

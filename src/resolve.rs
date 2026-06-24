@@ -463,7 +463,10 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
         tick: world.tick,
         ..Default::default()
     };
-    let terrain = &world.terrain;
+    // Disjoint field borrows (terrain + rooms) so the per-creep loop can read room-aware terrain
+    // while mutably iterating creeps. Mirrors `terrain_for` inline (can't call the &self method here).
+    let default_terrain = &world.terrain;
+    let rooms = &world.rooms;
     for c in world.creeps.iter_mut() {
         // Movement application (engine movement.execute, before damage): move, then add move
         // fatigue (0 on a room-edge tile), then regen (-2 × MOVE parts).
@@ -473,6 +476,8 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
             let move_fatigue = if crate::movement::is_edge(x, y) {
                 0
             } else {
+                // Room-aware (S1): fatigue from the DESTINATION room's terrain.
+                let terrain = rooms.get(&np.room_name()).unwrap_or(default_terrain);
                 c.body.fatigue_weight() * terrain.fatigue_rate(x, y)
             };
             c.fatigue += move_fatigue;
