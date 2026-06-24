@@ -10,13 +10,16 @@
 
 use crate::resolve::{resolve_tick, CombatAction, Intents, TickReport, TowerAction};
 use crate::state::{CombatWorld, CreepId, PlayerId, StructureId, StructureKind};
-use screeps::Direction;
+use screeps::{Direction, RoomName};
 
 /// A creep's state at the start of a recorded tick.
 #[derive(Clone, Debug)]
 pub struct CreepFrame {
     pub id: CreepId,
     pub owner: PlayerId,
+    /// The room this creep is in (multi-room replays place each entity in its room's panel; `x,y` are
+    /// the in-room coordinates).
+    pub room: RoomName,
     pub x: u8,
     pub y: u8,
     pub hits: u32,
@@ -36,6 +39,7 @@ pub struct StructureFrame {
     pub id: StructureId,
     pub kind: StructureKind,
     pub owner: Option<PlayerId>,
+    pub room: RoomName,
     pub x: u8,
     pub y: u8,
     pub hits: u32,
@@ -69,6 +73,7 @@ pub struct CreepResult {
 pub struct TowerFrame {
     pub id: StructureId,
     pub owner: PlayerId,
+    pub room: RoomName,
     pub x: u8,
     pub y: u8,
     pub energy: u32,
@@ -179,6 +184,7 @@ pub fn record_tick(
         .map(|c| CreepFrame {
             id: c.id,
             owner: c.owner,
+            room: c.pos.room_name(),
             x: c.pos.x().u8(),
             y: c.pos.y().u8(),
             hits: c.body.hits,
@@ -195,6 +201,7 @@ pub fn record_tick(
             id: s.id,
             kind: s.kind,
             owner: s.owner,
+            room: s.pos.room_name(),
             x: s.pos.x().u8(),
             y: s.pos.y().u8(),
             hits: s.hits,
@@ -207,6 +214,7 @@ pub fn record_tick(
         .map(|t| TowerFrame {
             id: t.id,
             owner: t.owner,
+            room: t.pos.room_name(),
             x: t.pos.x().u8(),
             y: t.pos.y().u8(),
             energy: t.energy,
