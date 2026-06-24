@@ -54,8 +54,9 @@ pub fn is_edge(x: u8, y: u8) -> bool {
 
 struct Mover {
     id: CreepId,
-    current: (u8, u8),
-    dest: (u8, u8),
+    /// Room-qualified start + destination (S2): contention maps key by full `Position`, so two creeps
+    /// at the same `(x,y)` in DIFFERENT rooms never falsely contend, chain-block, or swap.
+    current_pos: Position,
     dest_pos: Position,
     move_rate: u32,
     weight: u32,   // min 1
@@ -63,20 +64,16 @@ struct Mover {
     pulling: bool, // dragging another (engine `_pull`, rate3)
 }
 
-fn xy(p: Position) -> (u8, u8) {
-    (p.x().u8(), p.y().u8())
-}
-
-fn rate1(movers: &[Mover], want_count: &HashMap<(u8, u8), usize>, i: usize) -> u32 {
+fn rate1(movers: &[Mover], want_count: &HashMap<Position, usize>, i: usize) -> u32 {
     let m = &movers[i];
     // Mutual swap: some mover is currently on m's destination and wants m's current tile.
     let swap = movers
         .iter()
-        .any(|n| n.current == m.dest && n.dest == m.current);
+        .any(|n| n.current_pos == m.dest_pos && n.dest_pos == m.current_pos);
     if swap {
         100
     } else {
-        want_count.get(&m.current).copied().unwrap_or(0) as u32
+        want_count.get(&m.current_pos).copied().unwrap_or(0) as u32
     }
 }
 
@@ -139,8 +136,7 @@ pub fn resolve_moves_with_pulls(
         };
         movers.push(Mover {
             id: c.id,
-            current: xy(c.pos),
-            dest: xy(dest_pos),
+            current_pos: c.pos,
             dest_pos,
             move_rate: c.body.move_rate(),
             weight: c.body.fatigue_weight().max(1),
@@ -158,9 +154,8 @@ pub fn resolve_moves_with_pulls(
         let p = creep_by_id[&puller];
         movers.push(Mover {
             id: target,
-            current: xy(t.pos),
-            dest: xy(p.pos), // into the puller's vacated tile
-            dest_pos: p.pos,
+            current_pos: t.pos,
+            dest_pos: p.pos, // into the puller's vacated tile
             move_rate: t.body.move_rate(),
             weight: t.body.fatigue_weight().max(1),
             pulled: true,
@@ -171,14 +166,14 @@ pub fn resolve_moves_with_pulls(
         return HashMap::new();
     }
 
-    let mut want_count: HashMap<(u8, u8), usize> = HashMap::new();
+    let mut want_count: HashMap<Position, usize> = HashMap::new();
     for m in &movers {
-        *want_count.entry(m.dest).or_insert(0) += 1;
+        *want_count.entry(m.dest_pos).or_insert(0) += 1;
     }
     // dest tile -> contending mover indices.
-    let mut matrix: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
+    let mut matrix: HashMap<Position, Vec<usize>> = HashMap::new();
     for (i, m) in movers.iter().enumerate() {
-        matrix.entry(m.dest).or_default().push(i);
+        matrix.entry(m.dest_pos).or_default().push(i);
     }
     // dest tile -> movers wanting it (for chain-block: a stayed creep blocks followers).
     let want_idx = matrix.clone();
@@ -214,11 +209,11 @@ pub fn resolve_moves_with_pulls(
     }
 
     // All living creeps by current tile (to detect non-moving blockers).
-    let creep_at: HashMap<(u8, u8), CreepId> = world
+    let creep_at: HashMap<Position, CreepId> = world
         .creeps
         .iter()
         .filter(|c| c.is_alive())
-        .map(|c| ((c.pos.x().u8(), c.pos.y().u8()), c.id))
+        .map(|c| (c.pos, c.id))
         .collect();
     let mover_idx_of: HashMap<CreepId, usize> =
         movers.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
@@ -231,10 +226,12 @@ pub fn resolve_moves_with_pulls(
             continue;
         }
         // Room-aware (S1): a cross-room dest checks the destination room's terrain, not the start room's.
-        let wall = world.terrain_for(m.dest_pos.room_name()).is_wall(m.dest.0, m.dest.1);
+        let wall = world
+            .terrain_for(m.dest_pos.room_name())
+            .is_wall(m.dest_pos.x().u8(), m.dest_pos.y().u8());
         // Destination blocked iff a creep is there that won't vacate (non-mover, or a mover that
         // isn't moving). A mover at dest that IS moving vacates it → not a blocker.
-        let occupied = match creep_at.get(&m.dest) {
+        let occupied = match creep_at.get(&m.dest_pos) {
             Some(cid) => match mover_idx_of.get(cid) {
                 Some(&j) => !moving[j],
                 None => true,
@@ -248,7 +245,7 @@ pub fn resolve_moves_with_pulls(
     }
     // Propagate: a creep that stays blocks every mover that wanted its current tile.
     while let Some(i) = stack.pop() {
-        if let Some(followers) = want_idx.get(&movers[i].current) {
+        if let Some(followers) = want_idx.get(&movers[i].current_pos) {
             for &j in followers {
                 if moving[j] {
                     moving[j] = false;
@@ -545,6 +542,31 @@ mod tests {
         assert!(
             resolve_moves(&make(true), &moves(&[(1, Direction::Right)])).is_empty(),
             "the same tile walled in the DESTINATION room blocks the cross"
+        );
+    }
+
+    #[test]
+    fn creeps_in_different_rooms_do_not_contend_for_the_same_xy() {
+        // Two creeps, one in each of two rooms, each stepping Right toward (25,25) in ITS OWN room.
+        // (x,y)-keyed contention (the pre-S2 bug) would make them fight over a single tile so only one
+        // moves; Position-keyed contention lets both advance.
+        let mk = |id: CreepId, name: &str| SimCreep {
+            id,
+            owner: 0,
+            pos: pos_in(name, 24, 25),
+            body: SimBody::new(vec![crate::body::BodyPartDef::new(Part::Move)]),
+            fatigue: 0,
+        };
+        let world = CombatWorld {
+            creeps: vec![mk(1, "W1N1"), mk(2, "W3N1")],
+            ..Default::default()
+        };
+        let r = resolve_moves(&world, &moves(&[(1, Direction::Right), (2, Direction::Right)]));
+        assert_eq!(r.get(&1), Some(&pos_in("W1N1", 25, 25)), "creep in room 1 advances");
+        assert_eq!(
+            r.get(&2),
+            Some(&pos_in("W3N1", 25, 25)),
+            "creep in room 2 advances too — no cross-room (x,y) contention"
         );
     }
 }

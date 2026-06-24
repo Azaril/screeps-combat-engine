@@ -237,19 +237,21 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
         .map(|(i, s)| (s.id, i))
         .collect();
     let sstruct = |id: StructureId| struct_by_id.get(&id).map(|&i| &struct_snap[i]);
-    let rampart_tiles: HashSet<(u8, u8)> = struct_snap
+    // Room-qualified (S2): keying ramparts by full `Position` (not just `(x,y)`) so a rampart at a
+    // tile in one room cannot shield a creep/structure at the same `(x,y)` in a DIFFERENT room.
+    let rampart_tiles: HashSet<Position> = struct_snap
         .iter()
         .filter(|s| s.kind == StructureKind::Rampart)
-        .map(|s| (s.pos.x().u8(), s.pos.y().u8()))
+        .map(|s| s.pos)
         .collect();
     // Tile → the rampart's id on it, for the single-target damage REDIRECT (engine `attack.js:33-36`,
     // `rangedAttack.js:33-36`, `towers/attack.js:27-30`, `dismantle.js:27-29`): a single-target
     // attack/ranged/tower/dismantle on any object standing on a rampart hits the RAMPART instead
     // (ownership-blind). RMA is the exception — it *skips* a shielded target rather than redirecting.
-    let rampart_id_at: HashMap<(u8, u8), StructureId> = struct_snap
+    let rampart_id_at: HashMap<Position, StructureId> = struct_snap
         .iter()
         .filter(|s| s.kind == StructureKind::Rampart)
-        .map(|s| ((s.pos.x().u8(), s.pos.y().u8()), s.id))
+        .map(|s| (s.pos, s.id))
         .collect();
 
     let safe_owner = world.safe_mode_owner;
@@ -261,12 +263,12 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
     let zeroed_s = |attacker_owner: PlayerId, target_owner: Option<PlayerId>| -> bool {
         matches!((safe_owner, target_owner), (Some(o), Some(t)) if attacker_owner != o && t == o)
     };
-    let on_rampart = |p: Position| rampart_tiles.contains(&(p.x().u8(), p.y().u8()));
+    let on_rampart = |p: Position| rampart_tiles.contains(&p);
     // The rampart a single-target hit on `pos` redirects to, if any — `self_id` is the target's own
     // id (a rampart is never redirected onto itself). `None` ⇒ no rampart on the tile, hit normally.
     let redirect = |pos: Position, self_id: Option<StructureId>| -> Option<StructureId> {
         rampart_id_at
-            .get(&(pos.x().u8(), pos.y().u8()))
+            .get(&pos)
             .copied()
             .filter(|&rid| Some(rid) != self_id)
     };
@@ -875,6 +877,47 @@ mod tests {
         assert_eq!(rep.outcomes[&2].raw_damage, 0, "single-target ranged is redirected away from the creep");
         let rampart_hits = w.structures.iter().find(|s| s.id == 100).unwrap().hits;
         assert_eq!(rampart_hits, 300_000 - 100, "the shot landed on the rampart (10 RANGED × 10 power)");
+    }
+
+    #[test]
+    fn a_rampart_only_shields_within_its_own_room() {
+        // S2: attacker + target both in room B; a rampart at the target's EXACT (x,y) but in room A
+        // must NOT shield it (the pre-S2 (x,y)-keying would wrongly redirect the shot onto the
+        // other-room rampart). The same rampart in room B does shield. Pins Position-keyed redirect.
+        let at = |name: &str, x: u8, y: u8| {
+            let room: RoomName = name.parse().unwrap();
+            Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+        };
+        let make = |rampart_room: &str| {
+            let mut attacker = creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)]);
+            attacker.pos = at("W3N1", 25, 25);
+            let mut target = creep(2, 1, 25, 27, &[(Part::Move, 5)]);
+            target.pos = at("W3N1", 25, 27);
+            let mut rampart = structure(100, StructureKind::Rampart, Some(1), 25, 27, 300_000);
+            rampart.pos = at(rampart_room, 25, 27);
+            CombatWorld {
+                creeps: vec![attacker, target],
+                structures: vec![rampart],
+                ..Default::default()
+            }
+        };
+        // Rampart in a DIFFERENT room → no shield; the creep takes the ranged hit.
+        let mut w = make("W1N1");
+        let mut i = Intents::new();
+        i.set(1, vec![CombatAction::RangedAttack(2)]);
+        assert!(
+            resolve_tick(&mut w, &i).outcomes[&2].raw_damage > 0,
+            "a rampart in a DIFFERENT room must not shield the creep"
+        );
+        // Rampart in the SAME room → shielded via redirect; the creep takes 0.
+        let mut w = make("W3N1");
+        let mut i = Intents::new();
+        i.set(1, vec![CombatAction::RangedAttack(2)]);
+        assert_eq!(
+            resolve_tick(&mut w, &i).outcomes[&2].raw_damage,
+            0,
+            "a rampart in the SAME room shields the creep via redirect"
+        );
     }
 
     #[test]

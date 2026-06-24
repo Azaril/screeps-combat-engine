@@ -142,14 +142,7 @@ impl CombatWorld {
     pub fn terrain_mut(&mut self, room: RoomName) -> &mut CombatTerrain {
         self.rooms.entry(room).or_default()
     }
-    /// Is there a living rampart on this tile? (rangedMassAttack skips non-rampart targets here,
-    /// and an attacker standing here deals no melee attack-back.)
-    pub fn rampart_at(&self, x: u8, y: u8) -> bool {
-        self.structures.iter().any(|s| {
-            s.is_alive()
-                && s.kind == StructureKind::Rampart
-                && s.pos.x().u8() == x
-                && s.pos.y().u8() == y
-        })
-    }
+    // (Removed `rampart_at(x, y)` in S2 — it was dead code keyed by `(x,y)` only, the same single-room
+    // conflation S2 fixes elsewhere. The resolver's Position-keyed `rampart_tiles` is the single source
+    // of truth for rampart-shield/redirect logic.)
 }
