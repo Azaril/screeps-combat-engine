@@ -53,6 +53,8 @@ pub enum CombatAction {
     AttackStructure(StructureId),
     /// Ranged-attack a structure (RANGED_ATTACK parts, range 3).
     RangedAttackStructure(StructureId),
+    /// De-claim the controller in the actor's room (CLAIM parts, range 1) — the declaim/salvage action.
+    AttackController,
 }
 
 /// A tower's action for one tick (towers fire once, costing [`TOWER_ENERGY_COST`] energy).
@@ -173,6 +175,8 @@ struct Snap {
     heal: u32,
     ranged_heal: u32,
     dismantle: u32,
+    /// Controller-downgrade output (CLAIM parts × `CONTROLLER_ATTACK_PER_PART`) for `AttackController`.
+    controller_attack: u32,
 }
 
 /// Immutable per-structure snapshot for phase B target lookups (`world.structures` is mutated in
@@ -200,6 +204,7 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
             heal: c.body.heal_power(),
             ranged_heal: c.body.ranged_heal_power(),
             dismantle: c.body.dismantle_power(),
+            controller_attack: c.body.alive_part_count(screeps::Part::Claim) * crate::constants::CONTROLLER_ATTACK_PER_PART,
         })
         .collect();
     let by_id: HashMap<CreepId, usize> = snaps.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
@@ -277,6 +282,8 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
     let mut heal: HashMap<CreepId, u32> = HashMap::new();
     let mut struct_dmg: HashMap<StructureId, u32> = HashMap::new();
     let mut struct_heal: HashMap<StructureId, u32> = HashMap::new();
+    // De-claim accrual this tick: controller index (in world.controllers) → total downgrade reduction.
+    let mut controller_attack: HashMap<u32, u32> = HashMap::new();
     let add = |map: &mut HashMap<u32, u32>, id: u32, amt: u32| {
         if amt > 0 {
             *map.entry(id).or_insert(0) += amt;
@@ -393,6 +400,20 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
                         if atk.pos.get_range_to(s.pos) <= 3 && !zeroed_s(atk.owner, s.owner) {
                             add(&mut struct_dmg, redirect(s.pos, Some(sid)).unwrap_or(sid), atk.ranged);
                         }
+                    }
+                }
+                CombatAction::AttackController => {
+                    // De-claim the (claimed, hostile, in-room, range-1) controller — safe-mode protected
+                    // like any owned object. Accrues per CLAIM part; applied after movement below.
+                    let room = atk.pos.room_name();
+                    if let Some(idx) = world.controllers.iter().position(|c| {
+                        c.is_claimed()
+                            && c.pos.room_name() == room
+                            && atk.pos.get_range_to(c.pos) <= 1
+                            && c.owner != Some(atk.owner)
+                            && !zeroed_s(atk.owner, c.owner)
+                    }) {
+                        add(&mut controller_attack, idx as u32, atk.controller_attack);
                     }
                 }
             }
@@ -567,6 +588,18 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
     }
     world.towers.retain(|t| t.is_alive());
 
+    // Controllers: apply the de-claim accrual. When the downgrade countdown hits 0 the controller goes
+    // neutral (owner → None) — the declaim objective. (Movement above used start positions for the
+    // range check, matching the engine's intent-time resolution.)
+    for (idx, amt) in &controller_attack {
+        if let Some(c) = world.controllers.get_mut(*idx as usize) {
+            c.downgrade_ticks = c.downgrade_ticks.saturating_sub(*amt);
+            if c.downgrade_ticks == 0 {
+                c.owner = None;
+            }
+        }
+    }
+
     world.tick += 1;
     report
 }
@@ -615,6 +648,58 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn attack_controller_declaims_an_enemy_controller() {
+        // A CLAIM creep (owner 0) adjacent to an enemy (owner 1) controller de-claims it: each tick
+        // reduces downgrade_ticks by CLAIM parts × CONTROLLER_ATTACK_PER_PART; at 0 it goes neutral.
+        let claim_parts = 2u32;
+        let per_tick = claim_parts * crate::constants::CONTROLLER_ATTACK_PER_PART; // 600
+        let start = per_tick * 3 + 1; // 4 ticks to exhaust (3 full + a remainder)
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, claim_parts), (Part::Move, 1)])],
+            controllers: vec![SimController { pos: pos(25, 26), owner: Some(1), downgrade_ticks: start }],
+            ..Default::default()
+        };
+        let build = || {
+            let mut i = Intents::new();
+            i.set(1, vec![CombatAction::AttackController]);
+            i
+        };
+        for t in 0..3 {
+            resolve_tick(&mut world, &build());
+            assert!(world.controllers[0].is_claimed(), "still claimed after {} tick(s)", t + 1);
+        }
+        resolve_tick(&mut world, &build());
+        assert!(!world.controllers[0].is_claimed(), "de-claimed to neutral once the countdown hits 0");
+        assert_eq!(world.controllers[0].owner, None);
+    }
+
+    #[test]
+    fn attack_controller_needs_range_1_and_respects_safe_mode() {
+        // Out of range 1 → no accrual.
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
+            controllers: vec![SimController { pos: pos(25, 29), owner: Some(1), downgrade_ticks: 600 }],
+            ..Default::default()
+        };
+        let mut i = Intents::new();
+        i.set(1, vec![CombatAction::AttackController]);
+        resolve_tick(&mut world, &i);
+        assert_eq!(world.controllers[0].downgrade_ticks, 600, "no accrual beyond range 1");
+
+        // In range, but the controller's owner is in safe mode → protected (no accrual).
+        let mut world2 = CombatWorld {
+            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
+            controllers: vec![SimController { pos: pos(25, 26), owner: Some(1), downgrade_ticks: 600 }],
+            safe_mode_owner: Some(1),
+            ..Default::default()
+        };
+        let mut i2 = Intents::new();
+        i2.set(1, vec![CombatAction::AttackController]);
+        resolve_tick(&mut world2, &i2);
+        assert_eq!(world2.controllers[0].downgrade_ticks, 600, "safe-mode controller is protected");
     }
 
     #[test]

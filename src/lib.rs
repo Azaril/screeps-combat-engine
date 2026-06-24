@@ -49,6 +49,6 @@ pub use movement::resolve_moves;
 pub use record::{record_tick, CombatRecording, TickFrame};
 pub use resolve::{resolve_tick, CombatAction, Intents, TickReport, TowerAction};
 pub use state::{
-    CombatTerrain, CombatWorld, CreepId, PlayerId, SimCreep, SimStructure, SimTower, StructureId,
+    CombatTerrain, CombatWorld, CreepId, PlayerId, SimController, SimCreep, SimStructure, SimTower, StructureId,
     StructureKind,
 };

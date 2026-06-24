@@ -15,6 +15,9 @@ pub const RANGED_ATTACK_POWER: u32 = 10; // RANGED_ATTACK, range 3
 pub const HEAL_POWER: u32 = 12; // HEAL adjacent, range 1
 pub const RANGED_HEAL_POWER: u32 = 4; // HEAL at range, range 3
 pub const DISMANTLE_POWER: u32 = 50; // WORK dismantle, range 1
+/// `attackController` controller-downgrade per CLAIM part, range 1 (`attackController.js`: each CLAIM
+/// part reduces the target controller's downgrade timer; de-claim accrues until it hits 0 → neutral).
+pub const CONTROLLER_ATTACK_PER_PART: u32 = 300;
 
 // ── Action ranges (Chebyshev) ───────────────────────────────────────────────
 pub const ATTACK_RANGE: u32 = 1;

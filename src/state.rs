@@ -101,6 +101,26 @@ pub struct SimTower {
     pub hits_max: u32,
 }
 
+/// A room controller in the sim — the de-claim target for `attackController` (derelict-room salvage /
+/// neutralizing an enemy's controller). `downgrade_ticks` is the de-claim countdown: each
+/// `attackController` (CLAIM parts × [`CONTROLLER_ATTACK_PER_PART`]) reduces it; at 0 the controller
+/// goes neutral (`owner = None`). A neutral/unowned controller (`owner == None`) is not a de-claim
+/// target. (A minimal model — enough to simulate a declaim mission; the full upgrade-block / reservation
+/// mechanics are not modeled.)
+#[derive(Clone, Debug)]
+pub struct SimController {
+    pub pos: Position,
+    pub owner: Option<PlayerId>,
+    pub downgrade_ticks: u32,
+}
+
+impl SimController {
+    /// A de-claim target: owned by someone (a neutral controller can't be attacked further).
+    pub fn is_claimed(&self) -> bool {
+        self.owner.is_some()
+    }
+}
+
 impl SimTower {
     pub fn is_alive(&self) -> bool {
         self.hits > 0
@@ -122,6 +142,9 @@ pub struct CombatWorld {
     pub creeps: Vec<SimCreep>,
     pub towers: Vec<SimTower>,
     pub structures: Vec<SimStructure>,
+    /// Room controllers — the de-claim targets for `attackController` (one per room at most). Empty for
+    /// scenarios that don't model controllers (the common combat case).
+    pub controllers: Vec<SimController>,
     /// Owner whose controller is in safe mode this tick (all *hostile* combat zeroed), if any.
     pub safe_mode_owner: Option<PlayerId>,
     /// Owners that do NOT auto-exit at a room edge — the engine's NPC exemption (`creeps/tick.js:52`
