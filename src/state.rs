@@ -124,6 +124,11 @@ pub struct CombatWorld {
     pub structures: Vec<SimStructure>,
     /// Owner whose controller is in safe mode this tick (all *hostile* combat zeroed), if any.
     pub safe_mode_owner: Option<PlayerId>,
+    /// Owners that do NOT auto-exit at a room edge — the engine's NPC exemption (`creeps/tick.js:52`
+    /// skips users '2'/'3' = Source Keeper / Invader). Default empty (self-play: every creep
+    /// auto-exits like a player creep). Scenarios with NPCs register their owners here so keepers /
+    /// invaders stay in their room. See [`resolve_tick`](crate::resolve_tick)'s edge-exit pass.
+    pub npc_owners: HashSet<PlayerId>,
 }
 
 impl CombatWorld {

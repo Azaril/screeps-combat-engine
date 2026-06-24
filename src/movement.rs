@@ -18,11 +18,14 @@
 //!   the stripped creep's now-unvacated current tile — so a blocked front stops the whole column
 //!   (the cohesion mechanic).
 //!
-//! **Not modelled yet:** room-edge crossing (a step off the room is blocked here), roads (fatigue
-//! stays plain/swamp). Tracked in `AGENTS.md`.
+//! **Room-edge crossing is not a move here** — a step off the room edge returns `None` (engine
+//! `move.js:32` rejects it / `movement.js:88` clamps). The boundary cross is a separate **edge-exit
+//! relocation** in [`crate::resolve_tick`]'s Phase D (engine `creeps/tick.js:52` + `global.js:42`):
+//! a non-NPC creep standing on an exit tile is moved to the adjacent room's mirror tile.
+//! **Not modelled yet:** roads (fatigue stays plain/swamp). Tracked in `AGENTS.md`.
 
 use crate::state::*;
-use screeps::{Direction, Position};
+use screeps::{Direction, Position, RoomCoordinate};
 use std::collections::{HashMap, HashSet};
 
 /// (dx, dy) for a direction. Screeps y increases downward, so `Top` is `-y`.
@@ -39,12 +42,23 @@ fn dir_delta(dir: Direction) -> (i32, i32) {
     }
 }
 
-/// One step from `pos` in `dir`, **crossing room boundaries** (ADR 0023 S1: edge-crossing via
-/// world coordinates). `None` only if the step would leave the world map. A step off the room edge
-/// lands at the mirror tile of the adjacent room (e.g. `(49,25)` Right → `(0,25)` one room east).
+/// One step from `pos` in `dir` **within the room**, or `None` if it would leave the room. Crossing a
+/// room boundary is **not** a move intent: the engine rejects an off-edge move (`move.js:32`) and
+/// clamps it (`movement.js:88`). A creep reaches the exit tile via in-room moves, then the separate
+/// **edge-exit relocation** ([`crate::resolve_tick`]'s Phase D, engine `creeps/tick.js:52`) carries it
+/// to the adjacent room. Modelling the cross as a step would be the RTS model, not the engine's.
 pub fn step(pos: Position, dir: Direction) -> Option<Position> {
     let (dx, dy) = dir_delta(dir);
-    pos.checked_add((dx, dy)).ok()
+    let x = pos.x().u8() as i32 + dx;
+    let y = pos.y().u8() as i32 + dy;
+    if !(0..=49).contains(&x) || !(0..=49).contains(&y) {
+        return None;
+    }
+    Some(Position::new(
+        RoomCoordinate::new(x as u8).ok()?,
+        RoomCoordinate::new(y as u8).ok()?,
+        pos.room_name(),
+    ))
 }
 
 /// Room-edge tile (fatigue resets to 0 on entering one, `movement.js:242`).
@@ -267,7 +281,7 @@ pub fn resolve_moves_with_pulls(
 mod tests {
     use super::*;
     use crate::body::SimBody;
-    use screeps::{Part, RoomCoordinate, RoomName};
+    use screeps::{Part, RoomName};
 
     fn pos(x: u8, y: u8) -> Position {
         let room: RoomName = "W1N1".parse().unwrap();
@@ -493,55 +507,66 @@ mod tests {
     }
 
     #[test]
-    fn step_crosses_a_room_boundary() {
-        // A step off the east edge lands at the west edge of the adjacent room, y preserved — and the
-        // reverse step round-trips back to the origin (proves the crossing is consistent, no hardcoded
-        // neighbor name needed).
-        let crossed = step(pos_in("W1N1", 49, 25), Direction::Right).expect("a step off the edge crosses");
-        assert_ne!(crossed.room_name(), room("W1N1"), "left the start room");
-        assert_eq!((crossed.x().u8(), crossed.y().u8()), (0, 25), "wrapped to the next room's west edge, y preserved");
-        let back = step(crossed, Direction::Left).expect("steps back across the boundary");
-        assert_eq!(back, pos_in("W1N1", 49, 25), "the reverse step returns to the origin");
+    fn step_does_not_cross_room_boundaries() {
+        // A within-room step works; a step off the room edge returns None (crossing is NOT a move —
+        // engine `move.js:32` rejects it; the edge-exit relocation in resolve_tick does the cross).
+        assert_eq!(
+            step(pos_in("W1N1", 48, 25), Direction::Right),
+            Some(pos_in("W1N1", 49, 25)),
+            "an in-room step advances"
+        );
+        assert_eq!(
+            step(pos_in("W1N1", 49, 25), Direction::Right),
+            None,
+            "a step off the east edge is rejected (no within-room cross)"
+        );
+        assert_eq!(step(pos_in("W1N1", 0, 25), Direction::Left), None, "off the west edge: rejected");
+        assert_eq!(step(pos_in("W1N1", 25, 0), Direction::Top), None, "off the north edge: rejected");
+        assert_eq!(step(pos_in("W1N1", 25, 49), Direction::Bottom), None, "off the south edge: rejected");
     }
 
     #[test]
-    fn resolve_moves_carries_a_creep_across_a_boundary() {
-        // A creep on the east edge moving Right ends the tick in the adjacent room (open border).
+    fn resolve_moves_does_not_carry_a_creep_off_an_edge() {
+        // A creep on the east edge moving Right does NOT move within the room (the cross is the
+        // edge-exit relocation in resolve_tick, not a movement-phase step).
         let world = CombatWorld {
             creeps: vec![creep(1, 49, 25, &[(Part::Move, 1)], 0)],
             ..Default::default()
         };
-        let expected = step(pos_in("W1N1", 49, 25), Direction::Right).unwrap();
         let r = resolve_moves(&world, &moves(&[(1, Direction::Right)]));
-        assert_eq!(r.get(&1), Some(&expected), "resolve_moves carries the creep across, agreeing with step()");
+        assert!(r.is_empty(), "an off-edge move yields no within-room movement");
     }
 
     #[test]
-    fn cross_room_wall_check_uses_the_destination_room() {
-        // The wall check must read the DESTINATION room's terrain, not the start room's. A wall at the
-        // dest tile placed in the start room is the wrong room → ignored; the same tile walled in the
-        // destination room blocks the cross.
-        let dest = step(pos_in("W1N1", 49, 25), Direction::Right).unwrap();
-        let (dx, dy) = (dest.x().u8(), dest.y().u8());
-        let make = |wall_in_dest: bool| {
+    fn wall_check_reads_the_creeps_own_room_terrain() {
+        // Movement in a NON-default room reads that room's terrain override (S1 room-aware terrain): a
+        // creep in W3N1 moving within W3N1 is blocked by a wall placed in W3N1's override, and the
+        // default terrain (a different room) is not consulted.
+        let mk = |wall: bool| {
             let mut w = CombatWorld {
-                creeps: vec![creep(1, 49, 25, &[(Part::Move, 1)], 0)],
+                creeps: vec![SimCreep {
+                    id: 1,
+                    owner: 0,
+                    pos: pos_in("W3N1", 24, 25),
+                    body: SimBody::new(vec![crate::body::BodyPartDef::new(Part::Move)]),
+                    fatigue: 0,
+                }],
                 ..Default::default()
             };
-            w.terrain_mut(room("W1N1")).walls.insert((dx, dy)); // wrong room for the dest tile
-            if wall_in_dest {
-                w.terrain_mut(dest.room_name()).walls.insert((dx, dy));
+            w.terrain_mut(room("W1N1")).walls.insert((25, 25)); // a DIFFERENT room's wall — must be ignored
+            if wall {
+                w.terrain_mut(room("W3N1")).walls.insert((25, 25));
             }
             w
         };
         assert_eq!(
-            resolve_moves(&make(false), &moves(&[(1, Direction::Right)])).get(&1),
-            Some(&dest),
-            "a wall at the dest tile but in the WRONG (start) room does not block the cross"
+            resolve_moves(&mk(false), &moves(&[(1, Direction::Right)])).get(&1),
+            Some(&pos_in("W3N1", 25, 25)),
+            "a wall in a different room (W1N1) is ignored → the creep advances in W3N1"
         );
         assert!(
-            resolve_moves(&make(true), &moves(&[(1, Direction::Right)])).is_empty(),
-            "the same tile walled in the DESTINATION room blocks the cross"
+            resolve_moves(&mk(true), &moves(&[(1, Direction::Right)])).is_empty(),
+            "a wall in the creep's own room (W3N1) blocks it"
         );
     }
 

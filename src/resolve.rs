@@ -509,6 +509,35 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
 
     world.creeps.retain(|c| c.is_alive());
 
+    // ── Edge-exit relocation (engine `creeps/tick.js:52-78` + global stage `global.js:42`) ────────
+    // The room-boundary crossing — NOT a move intent. A non-NPC creep standing on an exit tile after
+    // movement is relocated to the adjacent room's mirror tile (the tile one step across that edge,
+    // which `checked_add` computes directly). Checked x==0, y==0, x==49, y==49 in `tick.js` order
+    // (corners are walls, so the priority never matters in practice). NPC creeps (keepers/invaders)
+    // never auto-exit. Same-tick: a creep that *moved* onto the edge this tick crosses this tick
+    // (engine `bulk.update` mutates in place, so `tick.js:52` sees the post-move position).
+    let npc_owners = &world.npc_owners;
+    for c in world.creeps.iter_mut() {
+        if npc_owners.contains(&c.owner) {
+            continue;
+        }
+        let (x, y) = (c.pos.x().u8(), c.pos.y().u8());
+        let offset = if x == 0 {
+            (-1, 0)
+        } else if y == 0 {
+            (0, -1)
+        } else if x == 49 {
+            (1, 0)
+        } else if y == 49 {
+            (0, 1)
+        } else {
+            continue; // not on an exit tile
+        };
+        if let Ok(np) = c.pos.checked_add(offset) {
+            c.pos = np;
+        }
+    }
+
     // Structures: no TOUGH/boost; net dismantle/attack damage against tower repair, destroyed at 0.
     for s in world.structures.iter_mut() {
         let d = struct_dmg.get(&s.id).copied().unwrap_or(0);
@@ -1115,5 +1144,65 @@ mod tests {
         resolve_tick(&mut world, &i);
         let b = world.towers.iter().find(|t| t.id == 201).expect("alive");
         assert_eq!(b.hits, 1800, "friendly tower repaired by 800");
+    }
+
+    // ── Edge-exit relocation (ADR 0023 — engine creeps/tick.js:52 + global.js:42) ─────────────────
+
+    #[test]
+    fn edge_exit_relocates_an_idle_creep_to_the_adjacent_room() {
+        // A non-NPC creep standing on an exit tile is relocated to the adjacent room's mirror tile
+        // after the tick — with NO move intent (the cross is automatic, not a move).
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+            ..Default::default()
+        };
+        resolve_tick(&mut world, &Intents::new());
+        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
+        assert_ne!(c.pos.room_name(), pos(0, 0).room_name(), "left the start room across the east edge");
+        assert_eq!((c.pos.x().u8(), c.pos.y().u8()), (0, 25), "arrived at the mirror tile (0,25)");
+    }
+
+    #[test]
+    fn edge_exit_is_same_tick_when_a_creep_moves_onto_an_edge() {
+        // A creep that MOVES onto an exit tile this tick crosses the same tick (engine bulk.update
+        // mutates in place → tick.js:52 sees the post-move position): (48,25) move Right → next room.
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 48, 25, &[(Part::Move, 1)])],
+            ..Default::default()
+        };
+        let mut i = Intents::new();
+        i.set_move(1, Direction::Right);
+        resolve_tick(&mut world, &i);
+        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
+        assert_ne!(c.pos.room_name(), pos(0, 0).room_name(), "moved to the edge AND crossed in one tick");
+        assert_eq!((c.pos.x().u8(), c.pos.y().u8()), (0, 25));
+    }
+
+    #[test]
+    fn edge_exit_skips_npc_creeps() {
+        // NPC creeps (keepers/invaders) do NOT auto-exit (engine skips users '2'/'3').
+        let mut world = CombatWorld {
+            creeps: vec![creep(7, 2, 49, 25, &[(Part::Move, 1)])],
+            ..Default::default()
+        };
+        world.npc_owners.insert(2);
+        resolve_tick(&mut world, &Intents::new());
+        let c = world.creeps.iter().find(|c| c.id == 7).expect("alive");
+        assert_eq!(c.pos, pos(49, 25), "an NPC on an exit tile stays put");
+    }
+
+    #[test]
+    fn a_creep_moving_off_an_edge_inward_does_not_exit() {
+        // A creep on an exit tile that moves INWARD (off the edge) escapes the auto-exit and stays in
+        // the room (engine: tick.js:52 sees the post-move, non-edge position).
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+            ..Default::default()
+        };
+        let mut i = Intents::new();
+        i.set_move(1, Direction::Left); // inward
+        resolve_tick(&mut world, &i);
+        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
+        assert_eq!(c.pos, pos(48, 25), "moved inward, stayed in the room, no auto-exit");
     }
 }
