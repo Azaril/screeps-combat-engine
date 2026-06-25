@@ -136,29 +136,39 @@ pub struct TickReport {
     pub destroyed_structures: Vec<StructureId>,
 }
 
-/// Apply the engine intent priority/exclusion table to a creep's raw action list
-/// (`creeps/intents.js:3-31`, combat subset): rangedAttack dropped when rangedMassAttack present;
-/// melee attack dropped when any heal action present.
+/// Apply the real engine intent priority/exclusion table to a creep's raw action list, faithfully
+/// (`creeps/intents.js:3-23` `checkPriorities` — an intent fires iff none of its higher-priority
+/// conflicts are ALSO queued). Combat subset of the canonical table:
+/// - `attack` (melee, creep OR structure)   dropped by: `dismantle`, `attackController`, `rangedHeal`, `heal`
+/// - `rangedAttack` (creep OR structure)     dropped by: `rangedMassAttack`, `rangedHeal`
+/// - `rangedMassAttack`                       dropped by: `rangedHeal`
+/// - `attackController`                       dropped by: `rangedHeal`, `heal`
+/// - `dismantle`                              dropped by: `attackController`, `rangedHeal`, `heal`
+/// - `rangedHeal`                             dropped by: `heal`
+///
+/// NOTE the asymmetry that the earlier mirror got wrong: `rangedHeal` drops BOTH ranged-offense intents,
+/// but plain `heal` drops NEITHER ranged-offense (it only drops the melee `attack`). So `{rangedAttack,
+/// heal}` and `{rangedMassAttack, heal}` compose, while `{rangedAttack, rangedHeal}` and
+/// `{rangedMassAttack, rangedHeal}` do not. This must match `intents.js` exactly (the `intent_legality_*`
+/// parity tests pin it) or the harness is not a faithful oracle for the EV kernel (ADR 0025 §3).
 fn filtered_actions(actions: &[CombatAction]) -> Vec<CombatAction> {
-    let has_rma = actions
-        .iter()
-        .any(|a| matches!(a, CombatAction::RangedMassAttack));
-    // The 'attack' intent (melee, creep or structure) is dropped when a heal or dismantle is queued.
-    let drops_attack = actions.iter().any(|a| {
-        matches!(
-            a,
-            CombatAction::Heal(_) | CombatAction::RangedHeal(_) | CombatAction::Dismantle(_)
-        )
-    });
+    let has_heal = actions.iter().any(|a| matches!(a, CombatAction::Heal(_)));
+    let has_ranged_heal = actions.iter().any(|a| matches!(a, CombatAction::RangedHeal(_)));
+    let has_rma = actions.iter().any(|a| matches!(a, CombatAction::RangedMassAttack));
+    let has_attack_controller = actions.iter().any(|a| matches!(a, CombatAction::AttackController));
+    let has_dismantle = actions.iter().any(|a| matches!(a, CombatAction::Dismantle(_)));
+    let drops_melee = has_dismantle || has_attack_controller || has_ranged_heal || has_heal;
     actions
         .iter()
         .copied()
         .filter(|a| match a {
-            CombatAction::RangedAttack(_) | CombatAction::RangedAttackStructure(_) if has_rma => {
-                false
-            }
-            CombatAction::Attack(_) | CombatAction::AttackStructure(_) if drops_attack => false,
-            _ => true,
+            CombatAction::Attack(_) | CombatAction::AttackStructure(_) => !drops_melee,
+            CombatAction::RangedAttack(_) | CombatAction::RangedAttackStructure(_) => !(has_rma || has_ranged_heal),
+            CombatAction::RangedMassAttack => !has_ranged_heal,
+            CombatAction::AttackController => !(has_ranged_heal || has_heal),
+            CombatAction::Dismantle(_) => !(has_attack_controller || has_ranged_heal || has_heal),
+            CombatAction::RangedHeal(_) => !has_heal,
+            _ => true, // Heal + any non-conflicting action
         })
         .collect()
 }
@@ -609,6 +619,41 @@ mod tests {
     use super::*;
     use crate::body::{BodyPartDef, SimBody};
     use screeps::{Direction, Part, Position, RoomCoordinate, RoomName};
+
+    /// `filtered_actions` must mirror the real engine `intents.js` priority table EXACTLY (ADR 0025 §3) —
+    /// or the harness is not a faithful oracle for the EV kernel. The asymmetry that the old mirror missed:
+    /// `rangedHeal` drops BOTH ranged-offense intents; plain `heal` drops NEITHER.
+    #[test]
+    fn intent_legality_mirrors_the_engine_table() {
+        let kept = |acts: &[CombatAction]| -> std::collections::HashSet<std::mem::Discriminant<CombatAction>> {
+            filtered_actions(acts).iter().map(std::mem::discriminant).collect()
+        };
+        let has = |acts: &[CombatAction], a: CombatAction| kept(acts).contains(&std::mem::discriminant(&a));
+        // {Attack, RangedAttack} compose — the canonical front-line slot.
+        assert!(has(&[CombatAction::Attack(1), CombatAction::RangedAttack(1)], CombatAction::Attack(1)));
+        assert!(has(&[CombatAction::Attack(1), CombatAction::RangedAttack(1)], CombatAction::RangedAttack(1)));
+        // {Attack, Heal} -> heal drops melee.
+        assert!(!has(&[CombatAction::Attack(1), CombatAction::Heal(1)], CombatAction::Attack(1)));
+        assert!(has(&[CombatAction::Attack(1), CombatAction::Heal(1)], CombatAction::Heal(1)));
+        // {RangedAttack, Heal} compose — plain heal does NOT drop ranged.
+        assert!(has(&[CombatAction::RangedAttack(1), CombatAction::Heal(1)], CombatAction::RangedAttack(1)));
+        // {RangedMassAttack, Heal} compose.
+        assert!(has(&[CombatAction::RangedMassAttack, CombatAction::Heal(1)], CombatAction::RangedMassAttack));
+        // {RangedAttack, RangedHeal} -> rangedHeal drops ranged.
+        assert!(!has(&[CombatAction::RangedAttack(1), CombatAction::RangedHeal(1)], CombatAction::RangedAttack(1)));
+        // {RangedMassAttack, RangedHeal} -> rangedHeal drops RMA.
+        assert!(!has(&[CombatAction::RangedMassAttack, CombatAction::RangedHeal(1)], CombatAction::RangedMassAttack));
+        // {RangedAttack, RangedMassAttack} -> RMA drops single-target ranged.
+        assert!(!has(&[CombatAction::RangedAttack(1), CombatAction::RangedMassAttack], CombatAction::RangedAttack(1)));
+        // {RangedHeal, Heal} -> heal drops rangedHeal.
+        assert!(!has(&[CombatAction::RangedHeal(1), CombatAction::Heal(1)], CombatAction::RangedHeal(1)));
+        // {Dismantle, Attack} -> dismantle drops melee.
+        assert!(!has(&[CombatAction::Dismantle(0), CombatAction::Attack(1)], CombatAction::Attack(1)));
+        // {AttackController, Attack} -> attackController drops melee; {AttackController, Heal} -> heal drops it.
+        assert!(!has(&[CombatAction::AttackController, CombatAction::Attack(1)], CombatAction::Attack(1)));
+        assert!(!has(&[CombatAction::AttackController, CombatAction::Heal(1)], CombatAction::AttackController));
+        assert!(has(&[CombatAction::AttackController, CombatAction::RangedAttack(1)], CombatAction::AttackController));
+    }
 
     fn pos(x: u8, y: u8) -> Position {
         let room: RoomName = "W1N1".parse().unwrap();
