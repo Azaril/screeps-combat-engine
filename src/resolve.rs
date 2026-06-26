@@ -548,14 +548,17 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
     // never auto-exit. Same-tick: a creep that *moved* onto the edge this tick crosses this tick
     // (engine `bulk.update` mutates in place, so `tick.js:52` sees the post-move position).
     //
-    // FIDELITY CONTRACT — cross-room entry is occupancy-BLIND by engine design: `tick.js:52` sets the
-    // `interRoom` marker and `global.js:34/42` applies it guarded by `accessibleRooms[room]` ONLY, never
-    // tile occupancy/contention. So two (or N) non-NPC creeps MAY land on the same mirror tile and stay
-    // STACKED across ticks until they walk apart via the destination room's in-room move contention
-    // (`movement.rs::resolve_moves_with_pulls`, deterministic via its `tile_has_stayer` OR-fold). This is
-    // intentional fidelity — do NOT add a collision/shove/reject guard here; "no two creeps share a tile"
-    // is the WITHIN-room move-intent invariant, NOT a cross-room one, and enforcing it at the border would
-    // diverge from MMO. A pre-existing stack is simply TRANSPORTED by the per-creep relocation below.
+    // FIDELITY — the cross is occupancy-BLIND, like the real engine: `tick.js:52` sets the `interRoom`
+    // marker and `global.js:34/42` applies it guarded by `accessibleRooms[room]` ONLY, never tile
+    // occupancy. We mirror that (no border collision/shove/reject guard — adding one would diverge from
+    // MMO). Crucially, in a VALID world this never stacks: each exit tile maps to a UNIQUE mirror and each
+    // tile holds ≤1 creep (the within-room move resolver enforces it), so the cross is a PERMUTATION of
+    // exit-tile occupants (paired swaps + moves into empty tiles) — two creeps can never converge on one
+    // tile. The "one creep per tile" invariant is upheld by correct placement + movement UPSTREAM, not by a
+    // guard here. (A malformed start state with two creeps already on one tile would be transported as-is;
+    // the only historical source of that was a harness placement bug — `place_at_entry`'s clamp-collapse —
+    // now fixed. `movement.rs`'s `tile_has_stayer` OR-fold keeps the obstacle check order-independent even
+    // over such a degenerate input, as defence-in-depth.)
     let npc_owners = &world.npc_owners;
     for c in world.creeps.iter_mut() {
         if npc_owners.contains(&c.owner) {
@@ -1346,23 +1349,35 @@ mod tests {
     }
 
     #[test]
-    fn edge_exit_does_not_thin_a_cross_room_stack() {
-        // FIDELITY LOCK: cross-room entry is occupancy-BLIND (engine creeps/tick.js:52 + global.js:34/42 —
-        // guarded by accessibleRooms ONLY, never tile occupancy). A stack is TRANSPORTED across the border,
-        // NOT thinned/rejected/shoved — two non-NPC creeps on the same source exit tile both relocate to the
-        // same mirror tile and stay stacked (they unstack later via in-room contention, which is
-        // deterministic via movement.rs `tile_has_stayer`). Guards against a future anti-faithful "no two
-        // creeps on a tile" border guard. "At most one creep per tile" is the WITHIN-room move invariant,
-        // NOT a cross-room one.
+    fn cross_room_paired_exits_swap_not_stack() {
+        // FAITHFUL invariant — why a VALID world never produces a cross-room stack. Each exit tile maps to a
+        // UNIQUE mirror and every tile holds ≤1 creep (the within-room resolver enforces it), so the
+        // occupancy-blind cross is a PERMUTATION of exit-tile occupants: two creeps on PAIRED exit tiles
+        // (49,25,E1N1) ↔ (0,25,E2N1) SWAP rooms — they can never converge on one tile. (The sim's historical
+        // "two creeps on a tile" came from a HARNESS placement bug, `place_at_entry`'s clamp-collapse, NOT
+        // from the cross — now fixed; `sim_maintains_one_creep_per_tile` in the eval guards the invariant.)
+        let p = |room: &str, x: u8, y: u8| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room.parse().unwrap());
+        let mk = |id: CreepId, pp: Position| SimCreep { id, owner: 0, pos: pp, body: SimBody::new(vec![BodyPartDef::new(Part::Move)]), fatigue: 0 };
+        let mut world = CombatWorld { creeps: vec![mk(1, p("E1N1", 49, 25)), mk(2, p("E2N1", 0, 25))], ..Default::default() };
+        resolve_tick(&mut world, &Intents::new());
+        let pos_of = |id: CreepId| world.creeps.iter().find(|c| c.id == id).unwrap().pos;
+        assert_eq!(pos_of(1), p("E2N1", 0, 25), "creep 1 crossed E1N1→E2N1");
+        assert_eq!(pos_of(2), p("E1N1", 49, 25), "creep 2 crossed E2N1→E1N1");
+        assert_ne!(pos_of(1), pos_of(2), "no stack — the cross is a permutation, not a collision");
+    }
+
+    #[test]
+    fn edge_exit_relocation_does_not_drop_a_degenerate_stack() {
+        // DEFENCE-IN-DEPTH: a valid world never stacks two creeps on a tile (see the permutation test above),
+        // but if a malformed input ever did, the per-creep relocation must transport it as-is — not silently
+        // drop a creep. (We do NOT add a border collision guard: the real engine's cross is occupancy-blind,
+        // global.js:34/42, and a guard would diverge from MMO. The invariant is upheld upstream by placement.)
         let mut world = CombatWorld {
             creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)]), creep(2, 0, 49, 25, &[(Part::Move, 1)])],
             ..Default::default()
         };
         resolve_tick(&mut world, &Intents::new());
         assert_eq!(world.creeps.len(), 2, "both creeps survive the border — none dropped");
-        let (a, b) = (world.creeps[0].pos, world.creeps[1].pos);
-        assert_eq!(a, b, "both relocated to the SAME mirror tile — stack transported, not thinned");
-        assert_ne!(a.room_name(), pos(0, 0).room_name(), "both crossed into the adjacent room");
-        assert_eq!((a.x().u8(), a.y().u8()), (0, 25), "mirror of the east exit (49,25) is (0,25)");
+        assert_eq!(world.creeps[0].pos, world.creeps[1].pos, "the degenerate stack is transported as-is");
     }
 }

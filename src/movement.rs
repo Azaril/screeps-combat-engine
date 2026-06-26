@@ -224,15 +224,14 @@ pub fn resolve_moves_with_pulls(
 
     let mover_idx_of: HashMap<CreepId, usize> =
         movers.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
-    // Per-tile "will an occupant REMAIN here this tick?" — an order-INDEPENDENT occupancy test. A tile can
-    // hold a STACK: real Screeps cross-room entry is occupancy-blind (engine creeps/tick.js:52 +
-    // global.js:34/42 guard room-accessibility ONLY, never tile occupancy), so >1 creep may legitimately
-    // share a Position after a border cross until they walk apart. A `HashMap<Position, CreepId>` collect
-    // keeps only ONE id per tile in `world.creeps` Vec-seed order, making the obstacle check below
-    // iteration-order-dependent (a bit-determinism break) whenever a stack exists. OR-fold instead — the
-    // tile blocks iff SOME occupant stays (a non-mover, or a mover that isn't moving); `|=` is commutative
-    // ⇒ order-independent. Keyed by full `Position` (room+x+y) so same-(x,y) tiles in different rooms never
-    // interact.
+    // Per-tile "will an occupant REMAIN here this tick?" — an order-INDEPENDENT occupancy test. In a VALID
+    // world every tile holds ≤1 creep, so this is exactly equivalent to the old per-creep `creep_at` lookup;
+    // it is DEFENCE-IN-DEPTH for a degenerate input where a tile holds a stack (which should never occur —
+    // placement + movement uphold one-creep-per-tile). A `HashMap<Position, CreepId>` collect would keep
+    // only ONE id per stacked tile in `world.creeps` Vec-seed order, making the obstacle check below
+    // iteration-order-dependent (a bit-determinism break). OR-fold instead — the tile blocks iff SOME
+    // occupant stays (a non-mover, or a mover that isn't moving); `|=` is commutative ⇒ order-independent.
+    // Keyed by full `Position` (room+x+y) so same-(x,y) tiles in different rooms never interact.
     let mut tile_has_stayer: HashMap<Position, bool> = HashMap::new();
     for c in world.creeps.iter().filter(|c| c.is_alive()) {
         let stays = match mover_idx_of.get(&c.id) {
