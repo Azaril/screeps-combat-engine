@@ -222,15 +222,25 @@ pub fn resolve_moves_with_pulls(
         }
     }
 
-    // All living creeps by current tile (to detect non-moving blockers).
-    let creep_at: HashMap<Position, CreepId> = world
-        .creeps
-        .iter()
-        .filter(|c| c.is_alive())
-        .map(|c| (c.pos, c.id))
-        .collect();
     let mover_idx_of: HashMap<CreepId, usize> =
         movers.iter().enumerate().map(|(i, m)| (m.id, i)).collect();
+    // Per-tile "will an occupant REMAIN here this tick?" — an order-INDEPENDENT occupancy test. A tile can
+    // hold a STACK: real Screeps cross-room entry is occupancy-blind (engine creeps/tick.js:52 +
+    // global.js:34/42 guard room-accessibility ONLY, never tile occupancy), so >1 creep may legitimately
+    // share a Position after a border cross until they walk apart. A `HashMap<Position, CreepId>` collect
+    // keeps only ONE id per tile in `world.creeps` Vec-seed order, making the obstacle check below
+    // iteration-order-dependent (a bit-determinism break) whenever a stack exists. OR-fold instead — the
+    // tile blocks iff SOME occupant stays (a non-mover, or a mover that isn't moving); `|=` is commutative
+    // ⇒ order-independent. Keyed by full `Position` (room+x+y) so same-(x,y) tiles in different rooms never
+    // interact.
+    let mut tile_has_stayer: HashMap<Position, bool> = HashMap::new();
+    for c in world.creeps.iter().filter(|c| c.is_alive()) {
+        let stays = match mover_idx_of.get(&c.id) {
+            Some(&j) => !moving[j], // a mover that is moving vacates; otherwise it stays
+            None => true,           // not a mover at all → stays
+        };
+        *tile_has_stayer.entry(c.pos).or_insert(false) |= stays;
+    }
 
     // ── Obstacle + chain-block (removeFromMatrix) ────────────────────────────────────────────────
     let mut stack: Vec<usize> = Vec::new();
@@ -243,15 +253,10 @@ pub fn resolve_moves_with_pulls(
         let wall = world
             .terrain_for(m.dest_pos.room_name())
             .is_wall(m.dest_pos.x().u8(), m.dest_pos.y().u8());
-        // Destination blocked iff a creep is there that won't vacate (non-mover, or a mover that
-        // isn't moving). A mover at dest that IS moving vacates it → not a blocker.
-        let occupied = match creep_at.get(&m.dest_pos) {
-            Some(cid) => match mover_idx_of.get(cid) {
-                Some(&j) => !moving[j],
-                None => true,
-            },
-            None => false,
-        };
+        // Destination blocked iff some occupant of dest will REMAIN there this tick (non-mover, or a mover
+        // that isn't moving). OR-folded into `tile_has_stayer` above, so the decision is independent of
+        // `world.creeps` iteration order even when dest holds a stack.
+        let occupied = tile_has_stayer.get(&m.dest_pos).copied().unwrap_or(false);
         if wall || occupied {
             moving[i] = false;
             stack.push(i);
@@ -593,5 +598,29 @@ mod tests {
             Some(&pos_in("W3N1", 25, 25)),
             "creep in room 2 advances too — no cross-room (x,y) contention"
         );
+    }
+
+    #[test]
+    fn stacked_tile_obstacle_is_order_independent() {
+        // A transported same-tile stack is FAITHFUL: real Screeps cross-room entry is occupancy-blind
+        // (engine creeps/tick.js:52 + global.js:34/42 — the relocation guards room-accessibility only,
+        // never tile occupancy), so two creeps legitimately share a Position until they walk apart. The
+        // obstacle decision over such a stack must NOT depend on `world.creeps` Vec order. Here A@(0,25) is
+        // a mover vacating (Top), B@(0,25) is a NON-MOVER staying, C@(1,25) moves Left toward (0,25). B
+        // stays on (0,25), so C must ALWAYS be blocked — independent of which of A/B a `HashMap<Position,_>`
+        // happened to keep.
+        let mk = |order: &[u8; 3]| -> CombatWorld {
+            let by_id = |id: u8| match id {
+                1 => creep(1, 0, 25, &[(Part::Move, 1)], 0),   // A: mover, will move Top (vacates 0,25)
+                2 => creep(2, 0, 25, &[(Part::Attack, 1)], 0), // B: no MOVE part → non-mover, stays on 0,25
+                _ => creep(3, 1, 25, &[(Part::Move, 1)], 0),   // C: mover, will move Left toward (0,25)
+            };
+            CombatWorld { creeps: order.iter().map(|&id| by_id(id)).collect(), ..Default::default() }
+        };
+        let mvs = moves(&[(1, Direction::Top), (3, Direction::Left)]);
+        let perms: [[u8; 3]; 6] = [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]];
+        let results: Vec<Option<Position>> = perms.iter().map(|p| resolve_moves(&mk(p), &mvs).get(&3).copied()).collect();
+        assert!(results.iter().all(|r| *r == results[0]), "C's resolved move must be order-independent over a stacked tile, got {results:?}");
+        assert_eq!(results[0], None, "C must be blocked by the staying B on (0,25) — engine-faithful (B does not vacate)");
     }
 }

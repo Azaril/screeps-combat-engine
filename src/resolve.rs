@@ -547,6 +547,15 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
     // (corners are walls, so the priority never matters in practice). NPC creeps (keepers/invaders)
     // never auto-exit. Same-tick: a creep that *moved* onto the edge this tick crosses this tick
     // (engine `bulk.update` mutates in place, so `tick.js:52` sees the post-move position).
+    //
+    // FIDELITY CONTRACT — cross-room entry is occupancy-BLIND by engine design: `tick.js:52` sets the
+    // `interRoom` marker and `global.js:34/42` applies it guarded by `accessibleRooms[room]` ONLY, never
+    // tile occupancy/contention. So two (or N) non-NPC creeps MAY land on the same mirror tile and stay
+    // STACKED across ticks until they walk apart via the destination room's in-room move contention
+    // (`movement.rs::resolve_moves_with_pulls`, deterministic via its `tile_has_stayer` OR-fold). This is
+    // intentional fidelity — do NOT add a collision/shove/reject guard here; "no two creeps share a tile"
+    // is the WITHIN-room move-intent invariant, NOT a cross-room one, and enforcing it at the border would
+    // diverge from MMO. A pre-existing stack is simply TRANSPORTED by the per-creep relocation below.
     let npc_owners = &world.npc_owners;
     for c in world.creeps.iter_mut() {
         if npc_owners.contains(&c.owner) {
@@ -1334,5 +1343,26 @@ mod tests {
         resolve_tick(&mut world, &i);
         let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
         assert_eq!(c.pos, pos(48, 25), "moved inward, stayed in the room, no auto-exit");
+    }
+
+    #[test]
+    fn edge_exit_does_not_thin_a_cross_room_stack() {
+        // FIDELITY LOCK: cross-room entry is occupancy-BLIND (engine creeps/tick.js:52 + global.js:34/42 —
+        // guarded by accessibleRooms ONLY, never tile occupancy). A stack is TRANSPORTED across the border,
+        // NOT thinned/rejected/shoved — two non-NPC creeps on the same source exit tile both relocate to the
+        // same mirror tile and stay stacked (they unstack later via in-room contention, which is
+        // deterministic via movement.rs `tile_has_stayer`). Guards against a future anti-faithful "no two
+        // creeps on a tile" border guard. "At most one creep per tile" is the WITHIN-room move invariant,
+        // NOT a cross-room one.
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)]), creep(2, 0, 49, 25, &[(Part::Move, 1)])],
+            ..Default::default()
+        };
+        resolve_tick(&mut world, &Intents::new());
+        assert_eq!(world.creeps.len(), 2, "both creeps survive the border — none dropped");
+        let (a, b) = (world.creeps[0].pos, world.creeps[1].pos);
+        assert_eq!(a, b, "both relocated to the SAME mirror tile — stack transported, not thinned");
+        assert_ne!(a.room_name(), pos(0, 0).room_name(), "both crossed into the adjacent room");
+        assert_eq!((a.x().u8(), a.y().u8()), (0, 25), "mirror of the east exit (49,25) is (0,25)");
     }
 }
