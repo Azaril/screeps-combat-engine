@@ -8,6 +8,7 @@
 //! The data model lives here (the engine *mechanism*); a richer SVG/scrubber renderer is policy
 //! and lives in `screeps-combat-eval`. [`CombatRecording::render`] gives a readable text dump.
 
+use crate::body_combat::SimBodyCombat;
 use crate::resolve::{resolve_tick, CombatAction, Intents, TickReport, TowerAction};
 use crate::state::{CombatWorld, CreepId, PlayerId, StructureId, StructureKind};
 use screeps::{Direction, RoomName};
@@ -181,8 +182,9 @@ pub fn record_tick(
     world: &mut CombatWorld,
     intents: &Intents,
 ) -> TickReport {
-    let tick = world.tick;
+    let tick = world.movement.tick;
     let creeps: Vec<CreepFrame> = world
+        .movement
         .creeps
         .iter()
         .map(|c| CreepFrame {
@@ -288,7 +290,12 @@ pub fn record_tick(
                 .iter()
                 .find(|s| s.id == id)
                 .map(|s| s.kind)
-                .or_else(|| towers.iter().any(|t| t.id == id).then_some(StructureKind::Tower));
+                .or_else(|| {
+                    towers
+                        .iter()
+                        .any(|t| t.id == id)
+                        .then_some(StructureKind::Tower)
+                });
             (id, kind.unwrap_or(StructureKind::Wall))
         })
         .collect();
@@ -312,9 +319,9 @@ pub fn record_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::SimBody;
-    use crate::state::{SimCreep, SimStructure};
+    use crate::state::{MovementState, SimCreep, SimStructure};
     use screeps::{Part, Position, RoomCoordinate, RoomName};
+    use screeps_sim_core::SimBody;
 
     fn pos(x: u8, y: u8) -> Position {
         let room: RoomName = "W1N1".parse().unwrap();
@@ -327,7 +334,9 @@ mod tests {
     fn creep(id: CreepId, owner: PlayerId, x: u8, y: u8, parts: &[(Part, u32)]) -> SimCreep {
         let body: Vec<_> = parts
             .iter()
-            .flat_map(|&(p, n)| std::iter::repeat_n(crate::body::BodyPartDef::new(p), n as usize))
+            .flat_map(|&(p, n)| {
+                std::iter::repeat_n(screeps_sim_core::BodyPartDef::new(p), n as usize)
+            })
             .collect();
         SimCreep {
             id,
@@ -335,16 +344,20 @@ mod tests {
             pos: pos(x, y),
             body: SimBody::new(body),
             fatigue: 0,
+            carry_used: 0,
         }
     }
 
     #[test]
     fn records_a_kiting_engagement_with_reasons() {
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]),
-                creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]),
+                    creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut rec = CombatRecording::new();
@@ -378,7 +391,10 @@ mod tests {
     #[test]
     fn records_a_breach_with_destruction() {
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Work, 10)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Work, 10)])],
+                ..Default::default()
+            },
             structures: vec![SimStructure {
                 id: 100,
                 kind: StructureKind::Wall,

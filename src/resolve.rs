@@ -1,7 +1,7 @@
 //! The deterministic combat tick — the **two-phase accumulate-then-apply** resolution that is the
 //! heart of the engine port (`processor.js`). One `resolve_tick` runs: **Phase B** — creep combat
 //! actions + tower fire accumulate into per-target damage/heal pools (from tick-START positions);
-//! **Phase C** — same-tile movement resolution (the [`crate::movement`] module); **Phase D** —
+//! **Phase C** — same-tile movement resolution (the kernel `screeps_sim_core::movement`); **Phase D** —
 //! apply movement + fatigue, then net **damage-then-heal** per object and run the death check.
 //! Attacks use start positions, so a creep cannot dodge a hit by moving. Drives EXP-FOUND-1 /
 //! EXP-FOCUS-1 (kill inequality, focus-fire) and EXP-KITE-1 (range-3 kiting at MOVE parity).
@@ -29,6 +29,7 @@
 //! pull-based movement (rate2/rate3) is modelled. **Not yet modelled:** NPC AI, power creeps,
 //! multi-room, room-edge crossing. Tracked in `AGENTS.md`.
 
+use crate::body_combat::SimBodyCombat;
 use crate::constants::TOWER_ENERGY_COST;
 use crate::damage::{
     ranged_mass_attack_damage, tower_attack_damage_at_range, tower_heal_at_range,
@@ -36,6 +37,7 @@ use crate::damage::{
 };
 use crate::state::*;
 use screeps::{Direction, Position};
+use screeps_sim_core::MoveIntents;
 use std::collections::{HashMap, HashSet};
 
 /// A creep combat action for one tick. Movement is separate (the `moves` field on [`Intents`]);
@@ -153,17 +155,27 @@ pub struct TickReport {
 /// parity tests pin it) or the harness is not a faithful oracle for the EV kernel (ADR 0025 §3).
 fn filtered_actions(actions: &[CombatAction]) -> Vec<CombatAction> {
     let has_heal = actions.iter().any(|a| matches!(a, CombatAction::Heal(_)));
-    let has_ranged_heal = actions.iter().any(|a| matches!(a, CombatAction::RangedHeal(_)));
-    let has_rma = actions.iter().any(|a| matches!(a, CombatAction::RangedMassAttack));
-    let has_attack_controller = actions.iter().any(|a| matches!(a, CombatAction::AttackController));
-    let has_dismantle = actions.iter().any(|a| matches!(a, CombatAction::Dismantle(_)));
+    let has_ranged_heal = actions
+        .iter()
+        .any(|a| matches!(a, CombatAction::RangedHeal(_)));
+    let has_rma = actions
+        .iter()
+        .any(|a| matches!(a, CombatAction::RangedMassAttack));
+    let has_attack_controller = actions
+        .iter()
+        .any(|a| matches!(a, CombatAction::AttackController));
+    let has_dismantle = actions
+        .iter()
+        .any(|a| matches!(a, CombatAction::Dismantle(_)));
     let drops_melee = has_dismantle || has_attack_controller || has_ranged_heal || has_heal;
     actions
         .iter()
         .copied()
         .filter(|a| match a {
             CombatAction::Attack(_) | CombatAction::AttackStructure(_) => !drops_melee,
-            CombatAction::RangedAttack(_) | CombatAction::RangedAttackStructure(_) => !(has_rma || has_ranged_heal),
+            CombatAction::RangedAttack(_) | CombatAction::RangedAttackStructure(_) => {
+                !(has_rma || has_ranged_heal)
+            }
             CombatAction::RangedMassAttack => !has_ranged_heal,
             CombatAction::AttackController => !(has_ranged_heal || has_heal),
             CombatAction::Dismantle(_) => !(has_attack_controller || has_ranged_heal || has_heal),
@@ -174,7 +186,7 @@ fn filtered_actions(actions: &[CombatAction]) -> Vec<CombatAction> {
 }
 
 /// Immutable per-creep snapshot taken before accumulation, so phase B can read attacker/target
-/// powers + positions without borrowing `world.creeps` (phase D mutates it).
+/// powers + positions without borrowing `world.movement.creeps` (phase D mutates it).
 struct Snap {
     id: CreepId,
     owner: PlayerId,
@@ -199,9 +211,12 @@ struct StructSnap {
 }
 
 /// Resolve one combat tick in place. Returns a [`TickReport`]. Dead creeps are removed from
-/// `world.creeps` at the end of the tick.
+/// `world.movement.creeps` at the end of the tick.
 pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
+    // Capture the report tick BEFORE the kernel mover increments `world.movement.tick`.
+    let report_tick = world.movement.tick;
     let snaps: Vec<Snap> = world
+        .movement
         .creeps
         .iter()
         .map(|c| Snap {
@@ -214,7 +229,8 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
             heal: c.body.heal_power(),
             ranged_heal: c.body.ranged_heal_power(),
             dismantle: c.body.dismantle_power(),
-            controller_attack: c.body.alive_part_count(screeps::Part::Claim) * crate::constants::CONTROLLER_ATTACK_PER_PART,
+            controller_attack: c.body.alive_part_count(screeps::Part::Claim)
+                * crate::constants::CONTROLLER_ATTACK_PER_PART,
         })
         .collect();
     let by_id: HashMap<CreepId, usize> = snaps.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
@@ -326,7 +342,10 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
                                 add(&mut dmg, tid, atk.attack);
                                 // Melee attack-back: the target's ATTACK parts hit the attacker —
                                 // unless the attacker stands on a rampart (engine `_damage.js:17`).
-                                if t.attack > 0 && !on_rampart(atk.pos) && !zeroed(t.owner, atk.owner) {
+                                if t.attack > 0
+                                    && !on_rampart(atk.pos)
+                                    && !zeroed(t.owner, atk.owner)
+                                {
                                     add(&mut dmg, atk.id, t.attack);
                                 }
                             }
@@ -394,21 +413,33 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
                         if atk.pos.get_range_to(s.pos) <= 1 && !zeroed_s(atk.owner, s.owner) {
                             // A structure sheltered under a (different) rampart redirects to the rampart
                             // (engine `dismantle.js:27-29`); a rampart dismantled directly hits itself.
-                            add(&mut struct_dmg, redirect(s.pos, Some(sid)).unwrap_or(sid), atk.dismantle);
+                            add(
+                                &mut struct_dmg,
+                                redirect(s.pos, Some(sid)).unwrap_or(sid),
+                                atk.dismantle,
+                            );
                         }
                     }
                 }
                 CombatAction::AttackStructure(sid) => {
                     if let Some(s) = sstruct(sid) {
                         if atk.pos.get_range_to(s.pos) <= 1 && !zeroed_s(atk.owner, s.owner) {
-                            add(&mut struct_dmg, redirect(s.pos, Some(sid)).unwrap_or(sid), atk.attack);
+                            add(
+                                &mut struct_dmg,
+                                redirect(s.pos, Some(sid)).unwrap_or(sid),
+                                atk.attack,
+                            );
                         }
                     }
                 }
                 CombatAction::RangedAttackStructure(sid) => {
                     if let Some(s) = sstruct(sid) {
                         if atk.pos.get_range_to(s.pos) <= 3 && !zeroed_s(atk.owner, s.owner) {
-                            add(&mut struct_dmg, redirect(s.pos, Some(sid)).unwrap_or(sid), atk.ranged);
+                            add(
+                                &mut struct_dmg,
+                                redirect(s.pos, Some(sid)).unwrap_or(sid),
+                                atk.ranged,
+                            );
                         }
                     }
                 }
@@ -486,37 +517,26 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
         }
     }
 
-    // ── Phase C: resolve movement (engine movement.check), using tick-START positions ────────
-    // Attacks above were pooled from start positions, so a creep cannot dodge a hit by moving.
-    let new_positions =
-        crate::movement::resolve_moves_with_pulls(world, &intents.moves, &intents.pulls);
+    // ── Phase C: resolve movement — the kernel now OWNS contention + move/fatigue + edge-exit +
+    // tick++ (engine movement.check/execute + creeps/tick.js edge-exit; ADR 0033). Attacks above were
+    // pooled from tick-START positions, so a creep cannot dodge a hit by moving; the mover runs AFTER
+    // that accumulation, preserving kiting. The combat netting (damage → deaths → structures) that used
+    // to interleave in the former Phase-D per-creep loop is now a SEPARATE loop AFTER the mover — sound
+    // because per-creep *position* (movement) and *hits* (combat) are independent, and the edge-exit is
+    // occupancy-blind (relocating a soon-dead creep before it's retained changes nothing observable).
+    let mv = MoveIntents {
+        moves: intents.moves.clone(),
+        pulls: intents.pulls.clone(),
+        reasons: Default::default(),
+    };
+    screeps_sim_core::resolve_movement(&mut world.movement, &mv);
 
-    // ── Phase D: apply movement + fatigue, then net damage-then-heal, deaths ─────────────────
+    // ── Phase D: net damage-then-heal per creep, deaths (movement already applied by the mover) ──────
     let mut report = TickReport {
-        tick: world.tick,
+        tick: report_tick,
         ..Default::default()
     };
-    // Disjoint field borrows (terrain + rooms) so the per-creep loop can read room-aware terrain
-    // while mutably iterating creeps. Mirrors `terrain_for` inline (can't call the &self method here).
-    let default_terrain = &world.terrain;
-    let rooms = &world.rooms;
-    for c in world.creeps.iter_mut() {
-        // Movement application (engine movement.execute, before damage): move, then add move
-        // fatigue (0 on a room-edge tile), then regen (-2 × MOVE parts).
-        if let Some(&np) = new_positions.get(&c.id) {
-            c.pos = np;
-            let (x, y) = (np.x().u8(), np.y().u8());
-            let move_fatigue = if crate::movement::is_edge(x, y) {
-                0
-            } else {
-                // Room-aware (S1): fatigue from the DESTINATION room's terrain.
-                let terrain = rooms.get(&np.room_name()).unwrap_or(default_terrain);
-                c.body.fatigue_weight() * terrain.fatigue_rate(x, y)
-            };
-            c.fatigue += move_fatigue;
-        }
-        c.fatigue = c.fatigue.saturating_sub(c.body.fatigue_clear());
-
+    for c in world.movement.creeps.iter_mut() {
         let raw = dmg.get(&c.id).copied().unwrap_or(0);
         let healed = heal.get(&c.id).copied().unwrap_or(0);
         let effective = c.body.damage_after_tough(raw);
@@ -538,48 +558,10 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
         report.outcomes.insert(c.id, outcome);
     }
 
-    world.creeps.retain(|c| c.is_alive());
-
-    // ── Edge-exit relocation (engine `creeps/tick.js:52-78` + global stage `global.js:42`) ────────
-    // The room-boundary crossing — NOT a move intent. A non-NPC creep standing on an exit tile after
-    // movement is relocated to the adjacent room's mirror tile (the tile one step across that edge,
-    // which `checked_add` computes directly). Checked x==0, y==0, x==49, y==49 in `tick.js` order
-    // (corners are walls, so the priority never matters in practice). NPC creeps (keepers/invaders)
-    // never auto-exit. Same-tick: a creep that *moved* onto the edge this tick crosses this tick
-    // (engine `bulk.update` mutates in place, so `tick.js:52` sees the post-move position).
-    //
-    // FIDELITY — the cross is occupancy-BLIND, like the real engine: `tick.js:52` sets the `interRoom`
-    // marker and `global.js:34/42` applies it guarded by `accessibleRooms[room]` ONLY, never tile
-    // occupancy. We mirror that (no border collision/shove/reject guard — adding one would diverge from
-    // MMO). Crucially, in a VALID world this never stacks: each exit tile maps to a UNIQUE mirror and each
-    // tile holds ≤1 creep (the within-room move resolver enforces it), so the cross is a PERMUTATION of
-    // exit-tile occupants (paired swaps + moves into empty tiles) — two creeps can never converge on one
-    // tile. The "one creep per tile" invariant is upheld by correct placement + movement UPSTREAM, not by a
-    // guard here. (A malformed start state with two creeps already on one tile would be transported as-is;
-    // the only historical source of that was a harness placement bug — `place_at_entry`'s clamp-collapse —
-    // now fixed. `movement.rs`'s `tile_has_stayer` OR-fold keeps the obstacle check order-independent even
-    // over such a degenerate input, as defence-in-depth.)
-    let npc_owners = &world.npc_owners;
-    for c in world.creeps.iter_mut() {
-        if npc_owners.contains(&c.owner) {
-            continue;
-        }
-        let (x, y) = (c.pos.x().u8(), c.pos.y().u8());
-        let offset = if x == 0 {
-            (-1, 0)
-        } else if y == 0 {
-            (0, -1)
-        } else if x == 49 {
-            (1, 0)
-        } else if y == 49 {
-            (0, 1)
-        } else {
-            continue; // not on an exit tile
-        };
-        if let Ok(np) = c.pos.checked_add(offset) {
-            c.pos = np;
-        }
-    }
+    world.movement.creeps.retain(|c| c.is_alive());
+    // (Edge-exit relocation now lives in the kernel mover `screeps_sim_core::resolve_movement`, which
+    // ran above — the occupancy-blind cross is applied to every creep before the combat netting; a
+    // soon-dead creep's relocation is unobservable since it's retained out immediately after.)
 
     // Structures: no TOUGH/boost; net dismantle/attack damage against tower repair, destroyed at 0.
     for s in world.structures.iter_mut() {
@@ -622,15 +604,15 @@ pub fn resolve_tick(world: &mut CombatWorld, intents: &Intents) -> TickReport {
         }
     }
 
-    world.tick += 1;
+    // NOTE: no `tick += 1` here — the kernel mover (`resolve_movement`) already advanced the clock.
     report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::body::{BodyPartDef, SimBody};
     use screeps::{Direction, Part, Position, RoomCoordinate, RoomName};
+    use screeps_sim_core::{BodyPartDef, SimBody};
 
     /// `filtered_actions` must mirror the real engine `intents.js` priority table EXACTLY (ADR 0025 §3) —
     /// or the harness is not a faithful oracle for the EV kernel. The asymmetry that the old mirror missed:
@@ -640,31 +622,81 @@ mod tests {
         let kept = |acts: &[CombatAction]| -> std::collections::HashSet<std::mem::Discriminant<CombatAction>> {
             filtered_actions(acts).iter().map(std::mem::discriminant).collect()
         };
-        let has = |acts: &[CombatAction], a: CombatAction| kept(acts).contains(&std::mem::discriminant(&a));
+        let has = |acts: &[CombatAction], a: CombatAction| {
+            kept(acts).contains(&std::mem::discriminant(&a))
+        };
         // {Attack, RangedAttack} compose — the canonical front-line slot.
-        assert!(has(&[CombatAction::Attack(1), CombatAction::RangedAttack(1)], CombatAction::Attack(1)));
-        assert!(has(&[CombatAction::Attack(1), CombatAction::RangedAttack(1)], CombatAction::RangedAttack(1)));
+        assert!(has(
+            &[CombatAction::Attack(1), CombatAction::RangedAttack(1)],
+            CombatAction::Attack(1)
+        ));
+        assert!(has(
+            &[CombatAction::Attack(1), CombatAction::RangedAttack(1)],
+            CombatAction::RangedAttack(1)
+        ));
         // {Attack, Heal} -> heal drops melee.
-        assert!(!has(&[CombatAction::Attack(1), CombatAction::Heal(1)], CombatAction::Attack(1)));
-        assert!(has(&[CombatAction::Attack(1), CombatAction::Heal(1)], CombatAction::Heal(1)));
+        assert!(!has(
+            &[CombatAction::Attack(1), CombatAction::Heal(1)],
+            CombatAction::Attack(1)
+        ));
+        assert!(has(
+            &[CombatAction::Attack(1), CombatAction::Heal(1)],
+            CombatAction::Heal(1)
+        ));
         // {RangedAttack, Heal} compose — plain heal does NOT drop ranged.
-        assert!(has(&[CombatAction::RangedAttack(1), CombatAction::Heal(1)], CombatAction::RangedAttack(1)));
+        assert!(has(
+            &[CombatAction::RangedAttack(1), CombatAction::Heal(1)],
+            CombatAction::RangedAttack(1)
+        ));
         // {RangedMassAttack, Heal} compose.
-        assert!(has(&[CombatAction::RangedMassAttack, CombatAction::Heal(1)], CombatAction::RangedMassAttack));
+        assert!(has(
+            &[CombatAction::RangedMassAttack, CombatAction::Heal(1)],
+            CombatAction::RangedMassAttack
+        ));
         // {RangedAttack, RangedHeal} -> rangedHeal drops ranged.
-        assert!(!has(&[CombatAction::RangedAttack(1), CombatAction::RangedHeal(1)], CombatAction::RangedAttack(1)));
+        assert!(!has(
+            &[CombatAction::RangedAttack(1), CombatAction::RangedHeal(1)],
+            CombatAction::RangedAttack(1)
+        ));
         // {RangedMassAttack, RangedHeal} -> rangedHeal drops RMA.
-        assert!(!has(&[CombatAction::RangedMassAttack, CombatAction::RangedHeal(1)], CombatAction::RangedMassAttack));
+        assert!(!has(
+            &[CombatAction::RangedMassAttack, CombatAction::RangedHeal(1)],
+            CombatAction::RangedMassAttack
+        ));
         // {RangedAttack, RangedMassAttack} -> RMA drops single-target ranged.
-        assert!(!has(&[CombatAction::RangedAttack(1), CombatAction::RangedMassAttack], CombatAction::RangedAttack(1)));
+        assert!(!has(
+            &[
+                CombatAction::RangedAttack(1),
+                CombatAction::RangedMassAttack
+            ],
+            CombatAction::RangedAttack(1)
+        ));
         // {RangedHeal, Heal} -> heal drops rangedHeal.
-        assert!(!has(&[CombatAction::RangedHeal(1), CombatAction::Heal(1)], CombatAction::RangedHeal(1)));
+        assert!(!has(
+            &[CombatAction::RangedHeal(1), CombatAction::Heal(1)],
+            CombatAction::RangedHeal(1)
+        ));
         // {Dismantle, Attack} -> dismantle drops melee.
-        assert!(!has(&[CombatAction::Dismantle(0), CombatAction::Attack(1)], CombatAction::Attack(1)));
+        assert!(!has(
+            &[CombatAction::Dismantle(0), CombatAction::Attack(1)],
+            CombatAction::Attack(1)
+        ));
         // {AttackController, Attack} -> attackController drops melee; {AttackController, Heal} -> heal drops it.
-        assert!(!has(&[CombatAction::AttackController, CombatAction::Attack(1)], CombatAction::Attack(1)));
-        assert!(!has(&[CombatAction::AttackController, CombatAction::Heal(1)], CombatAction::AttackController));
-        assert!(has(&[CombatAction::AttackController, CombatAction::RangedAttack(1)], CombatAction::AttackController));
+        assert!(!has(
+            &[CombatAction::AttackController, CombatAction::Attack(1)],
+            CombatAction::Attack(1)
+        ));
+        assert!(!has(
+            &[CombatAction::AttackController, CombatAction::Heal(1)],
+            CombatAction::AttackController
+        ));
+        assert!(has(
+            &[
+                CombatAction::AttackController,
+                CombatAction::RangedAttack(1)
+            ],
+            CombatAction::AttackController
+        ));
     }
 
     fn pos(x: u8, y: u8) -> Position {
@@ -687,6 +719,7 @@ mod tests {
             pos: pos(x, y),
             body: SimBody::new(body),
             fatigue: 0,
+            carry_used: 0,
         }
     }
 
@@ -715,8 +748,21 @@ mod tests {
         let per_tick = claim_parts * crate::constants::CONTROLLER_ATTACK_PER_PART; // 600
         let start = per_tick * 3 + 1; // 4 ticks to exhaust (3 full + a remainder)
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, claim_parts), (Part::Move, 1)])],
-            controllers: vec![SimController { pos: pos(25, 26), owner: Some(1), downgrade_ticks: start }],
+            movement: MovementState {
+                creeps: vec![creep(
+                    1,
+                    0,
+                    25,
+                    25,
+                    &[(Part::Claim, claim_parts), (Part::Move, 1)],
+                )],
+                ..Default::default()
+            },
+            controllers: vec![SimController {
+                pos: pos(25, 26),
+                owner: Some(1),
+                downgrade_ticks: start,
+            }],
             ..Default::default()
         };
         let build = || {
@@ -726,10 +772,17 @@ mod tests {
         };
         for t in 0..3 {
             resolve_tick(&mut world, &build());
-            assert!(world.controllers[0].is_claimed(), "still claimed after {} tick(s)", t + 1);
+            assert!(
+                world.controllers[0].is_claimed(),
+                "still claimed after {} tick(s)",
+                t + 1
+            );
         }
         resolve_tick(&mut world, &build());
-        assert!(!world.controllers[0].is_claimed(), "de-claimed to neutral once the countdown hits 0");
+        assert!(
+            !world.controllers[0].is_claimed(),
+            "de-claimed to neutral once the countdown hits 0"
+        );
         assert_eq!(world.controllers[0].owner, None);
     }
 
@@ -737,36 +790,59 @@ mod tests {
     fn attack_controller_needs_range_1_and_respects_safe_mode() {
         // Out of range 1 → no accrual.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
-            controllers: vec![SimController { pos: pos(25, 29), owner: Some(1), downgrade_ticks: 600 }],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
+                ..Default::default()
+            },
+            controllers: vec![SimController {
+                pos: pos(25, 29),
+                owner: Some(1),
+                downgrade_ticks: 600,
+            }],
             ..Default::default()
         };
         let mut i = Intents::new();
         i.set(1, vec![CombatAction::AttackController]);
         resolve_tick(&mut world, &i);
-        assert_eq!(world.controllers[0].downgrade_ticks, 600, "no accrual beyond range 1");
+        assert_eq!(
+            world.controllers[0].downgrade_ticks, 600,
+            "no accrual beyond range 1"
+        );
 
         // In range, but the controller's owner is in safe mode → protected (no accrual).
         let mut world2 = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
-            controllers: vec![SimController { pos: pos(25, 26), owner: Some(1), downgrade_ticks: 600 }],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Claim, 5), (Part::Move, 1)])],
+                ..Default::default()
+            },
+            controllers: vec![SimController {
+                pos: pos(25, 26),
+                owner: Some(1),
+                downgrade_ticks: 600,
+            }],
             safe_mode_owner: Some(1),
             ..Default::default()
         };
         let mut i2 = Intents::new();
         i2.set(1, vec![CombatAction::AttackController]);
         resolve_tick(&mut world2, &i2);
-        assert_eq!(world2.controllers[0].downgrade_ticks, 600, "safe-mode controller is protected");
+        assert_eq!(
+            world2.controllers[0].downgrade_ticks, 600,
+            "safe-mode controller is protected"
+        );
     }
 
     #[test]
     fn kill_inequality_attacker_beats_healer() {
         // A = 15 ATTACK (450 dps) vs B = 14 HEAL self-healing (168/tick). D > Hb ⇒ B dies.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::Attack, 15)]),
-                creep(2, 1, 25, 26, &[(Part::Heal, 14)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Attack, 15)]),
+                    creep(2, 1, 25, 26, &[(Part::Heal, 14)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let died = ticks_to_death(
@@ -790,10 +866,13 @@ mod tests {
     fn kill_inequality_heal_outpaces_attacker() {
         // A = 5 ATTACK (150 dps) vs B = 14 HEAL (168/tick). D < Hb ⇒ B never dies.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::Attack, 5)]),
-                creep(2, 1, 25, 26, &[(Part::Heal, 14)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Attack, 5)]),
+                    creep(2, 1, 25, 26, &[(Part::Heal, 14)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let died = ticks_to_death(
@@ -818,15 +897,18 @@ mod tests {
         // Target T = 10 MOVE (1000 hits, no self-heal), healer H = 20 HEAL (240/tick) adjacent.
         // One 5-ATTACK attacker (150 < 240) can't break it; two (300 > 240) can.
         let make = |attackers: usize| CombatWorld {
-            creeps: {
-                let mut v = vec![
-                    creep(99, 1, 25, 25, &[(Part::Move, 10)]), // target
-                    creep(50, 1, 25, 26, &[(Part::Heal, 20)]), // its healer
-                ];
-                for k in 0..attackers {
-                    v.push(creep(k as u32, 0, 24, 25 + k as u8, &[(Part::Attack, 5)]));
-                }
-                v
+            movement: MovementState {
+                creeps: {
+                    let mut v = vec![
+                        creep(99, 1, 25, 25, &[(Part::Move, 10)]), // target
+                        creep(50, 1, 25, 26, &[(Part::Heal, 20)]), // its healer
+                    ];
+                    for k in 0..attackers {
+                        v.push(creep(k as u32, 0, 24, 25 + k as u8, &[(Part::Attack, 5)]));
+                    }
+                    v
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -857,7 +939,10 @@ mod tests {
         // Hostile drain creep at the room edge (range ~20 from a centred tower → 150/tick) with
         // 13 HEAL (156/tick) self-heals through it; the tower bleeds 10 energy/shot.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 1, &[(Part::Heal, 13)])], // near the N edge
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 1, &[(Part::Heal, 13)])],
+                ..Default::default()
+            }, // near the N edge
             towers: vec![SimTower {
                 id: 200,
                 owner: 1,
@@ -875,7 +960,11 @@ mod tests {
             resolve_tick(&mut world, &i);
         }
         assert!(
-            world.creeps.iter().any(|c| c.id == 1 && c.is_alive()),
+            world
+                .movement
+                .creeps
+                .iter()
+                .any(|c| c.id == 1 && c.is_alive()),
             "drain out-heals the edge tower"
         );
         assert_eq!(
@@ -888,10 +977,13 @@ mod tests {
     fn safe_mode_zeroes_hostile_combat() {
         // Owner 0 is in safe mode; a hostile (owner 1) attacking owner-0's creep does nothing.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 1, 25, 25, &[(Part::Attack, 20)]),
-                creep(2, 0, 25, 26, &[(Part::Move, 5)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 1, 25, 25, &[(Part::Attack, 20)]),
+                    creep(2, 0, 25, 26, &[(Part::Move, 5)]),
+                ],
+                ..Default::default()
+            },
             safe_mode_owner: Some(0),
             ..Default::default()
         };
@@ -908,10 +1000,13 @@ mod tests {
     fn melee_attack_back_hits_the_attacker() {
         // Two melee creeps trade: each takes the other's attack power (the rampart-less case).
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::Attack, 10)]),
-                creep(2, 1, 25, 26, &[(Part::Attack, 10)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Attack, 10)]),
+                    creep(2, 1, 25, 26, &[(Part::Attack, 10)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut i = Intents::new();
@@ -930,13 +1025,16 @@ mod tests {
         // the chaser's range-1 melee never connects while range stays 3 — the kiter takes 0 melee
         // and chips the chaser down.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // kiter
-                creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]), // chaser, range 3 behind
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // kiter
+                    creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]), // chaser, range 3 behind
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let kiter_max = world.creeps[0].body.hits_max();
+        let kiter_max = world.movement.creeps[0].body.hits_max();
         for _ in 0..10 {
             let mut i = Intents::new();
             i.set(1, vec![CombatAction::RangedAttack(2)]); // kiter shoots
@@ -946,11 +1044,13 @@ mod tests {
             resolve_tick(&mut world, &i);
         }
         let kiter = world
+            .movement
             .creeps
             .iter()
             .find(|c| c.id == 1)
             .expect("kiter alive");
         let chaser = world
+            .movement
             .creeps
             .iter()
             .find(|c| c.id == 2)
@@ -986,7 +1086,10 @@ mod tests {
     fn dismantle_breaches_a_wall() {
         // A 10-WORK dismantler (500/tick) breaks a 1500-hit wall in 3 ticks (EXP-BREACH).
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Work, 10)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Work, 10)])],
+                ..Default::default()
+            },
             structures: vec![structure(100, StructureKind::Wall, None, 25, 26, 1500)],
             ..Default::default()
         };
@@ -1008,7 +1111,10 @@ mod tests {
     fn melee_destroys_a_spawn() {
         // 20-ATTACK (600/tick) destroys a 1000-hit spawn on the 2nd hit (1200 ≥ 1000).
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Attack, 20)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Attack, 20)])],
+                ..Default::default()
+            },
             structures: vec![structure(100, StructureKind::Spawn, Some(1), 25, 26, 1000)],
             ..Default::default()
         };
@@ -1029,25 +1135,46 @@ mod tests {
         // and the single-target shot lands on the rampart. (This pins the rampart-redirect fidelity
         // fix: the sim previously, wrongly, let single-target hit the creep through its rampart.)
         let make = || CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)]),
-                creep(2, 1, 25, 27, &[(Part::Move, 5)]),
-            ],
-            structures: vec![structure(100, StructureKind::Rampart, Some(1), 25, 27, 300_000)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)]),
+                    creep(2, 1, 25, 27, &[(Part::Move, 5)]),
+                ],
+                ..Default::default()
+            },
+            structures: vec![structure(
+                100,
+                StructureKind::Rampart,
+                Some(1),
+                25,
+                27,
+                300_000,
+            )],
             ..Default::default()
         };
         let mut w = make();
         let mut i = Intents::new();
         i.set(1, vec![CombatAction::RangedMassAttack]);
-        assert_eq!(resolve_tick(&mut w, &i).outcomes[&2].raw_damage, 0, "RMA skips a creep on a rampart");
+        assert_eq!(
+            resolve_tick(&mut w, &i).outcomes[&2].raw_damage,
+            0,
+            "RMA skips a creep on a rampart"
+        );
 
         let mut w = make();
         let mut i = Intents::new();
         i.set(1, vec![CombatAction::RangedAttack(2)]);
         let rep = resolve_tick(&mut w, &i);
-        assert_eq!(rep.outcomes[&2].raw_damage, 0, "single-target ranged is redirected away from the creep");
+        assert_eq!(
+            rep.outcomes[&2].raw_damage, 0,
+            "single-target ranged is redirected away from the creep"
+        );
         let rampart_hits = w.structures.iter().find(|s| s.id == 100).unwrap().hits;
-        assert_eq!(rampart_hits, 300_000 - 100, "the shot landed on the rampart (10 RANGED × 10 power)");
+        assert_eq!(
+            rampart_hits,
+            300_000 - 100,
+            "the shot landed on the rampart (10 RANGED × 10 power)"
+        );
     }
 
     #[test]
@@ -1057,7 +1184,11 @@ mod tests {
         // other-room rampart). The same rampart in room B does shield. Pins Position-keyed redirect.
         let at = |name: &str, x: u8, y: u8| {
             let room: RoomName = name.parse().unwrap();
-            Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+            Position::new(
+                RoomCoordinate::new(x).unwrap(),
+                RoomCoordinate::new(y).unwrap(),
+                room,
+            )
         };
         let make = |rampart_room: &str| {
             let mut attacker = creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)]);
@@ -1067,7 +1198,10 @@ mod tests {
             let mut rampart = structure(100, StructureKind::Rampart, Some(1), 25, 27, 300_000);
             rampart.pos = at(rampart_room, 25, 27);
             CombatWorld {
-                creeps: vec![attacker, target],
+                movement: MovementState {
+                    creeps: vec![attacker, target],
+                    ..Default::default()
+                },
                 structures: vec![rampart],
                 ..Default::default()
             }
@@ -1095,10 +1229,13 @@ mod tests {
     fn rampart_suppresses_attack_back() {
         // Attacker standing on a rampart melees a creep with ATTACK parts → target hit, no attack-back.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::Attack, 10)]),
-                creep(2, 1, 25, 26, &[(Part::Attack, 10)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Attack, 10)]),
+                    creep(2, 1, 25, 26, &[(Part::Attack, 10)]),
+                ],
+                ..Default::default()
+            },
             structures: vec![structure(
                 100,
                 StructureKind::Rampart,
@@ -1126,10 +1263,13 @@ mod tests {
     fn tower_heal_keeps_a_defender_alive() {
         // Our defender (no self-heal) is shot for 150/tick; a friendly tower heals 400/tick → lives.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 1, 25, 25, &[(Part::RangedAttack, 15)]), // hostile, 150 @ range 3
-                creep(2, 0, 25, 28, &[(Part::Move, 5)]),          // our defender
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 1, 25, 25, &[(Part::RangedAttack, 15)]), // hostile, 150 @ range 3
+                    creep(2, 0, 25, 28, &[(Part::Move, 5)]),          // our defender
+                ],
+                ..Default::default()
+            },
             towers: vec![SimTower {
                 id: 200,
                 owner: 0,
@@ -1147,7 +1287,11 @@ mod tests {
             resolve_tick(&mut world, &i);
         }
         assert!(
-            world.creeps.iter().any(|c| c.id == 2 && c.is_alive()),
+            world
+                .movement
+                .creeps
+                .iter()
+                .any(|c| c.id == 2 && c.is_alive()),
             "tower heal sustains the defender"
         );
     }
@@ -1156,7 +1300,10 @@ mod tests {
     fn tower_repair_outpaces_dismantle() {
         // Tower repair (800/tick at range ≤5) beats a 10-WORK dismantle (500/tick) → rampart holds.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 1, 25, 25, &[(Part::Work, 10)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 1, 25, 25, &[(Part::Work, 10)])],
+                ..Default::default()
+            },
             structures: vec![structure(
                 100,
                 StructureKind::Rampart,
@@ -1207,7 +1354,10 @@ mod tests {
     fn tower_destroyed_by_melee_attack() {
         // A 20-ATTACK creep (600/tick) destroys a hostile 1000-hit tower on the 2nd hit.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Attack, 20)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Attack, 20)])],
+                ..Default::default()
+            },
             towers: vec![tower(200, 1, 25, 26, 0, 1000)],
             ..Default::default()
         };
@@ -1226,7 +1376,10 @@ mod tests {
     fn rma_chips_a_tower() {
         // RMA at range 1 deals full ranged power (10 parts → 100) to a hostile tower.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::RangedAttack, 10)])],
+                ..Default::default()
+            },
             towers: vec![tower(200, 1, 25, 26, 0, 3000)],
             ..Default::default()
         };
@@ -1242,10 +1395,13 @@ mod tests {
         // Two-phase: a tower with one shot left fires (the attacker is hurt) AND is destroyed the
         // same tick by a co-resolving dismantle that exceeds its hits.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::Work, 20)]), // dismantler, 1000/tick > tower hits
-                creep(2, 0, 25, 24, &[(Part::Move, 5)]),  // the tower's victim
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Work, 20)]), // dismantler, 1000/tick > tower hits
+                    creep(2, 0, 25, 24, &[(Part::Move, 5)]),  // the tower's victim
+                ],
+                ..Default::default()
+            },
             towers: vec![tower(200, 1, 25, 26, 10, 800)],
             ..Default::default()
         };
@@ -1295,13 +1451,29 @@ mod tests {
         // A non-NPC creep standing on an exit tile is relocated to the adjacent room's mirror tile
         // after the tick — with NO move intent (the cross is automatic, not a move).
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            },
             ..Default::default()
         };
         resolve_tick(&mut world, &Intents::new());
-        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
-        assert_ne!(c.pos.room_name(), pos(0, 0).room_name(), "left the start room across the east edge");
-        assert_eq!((c.pos.x().u8(), c.pos.y().u8()), (0, 25), "arrived at the mirror tile (0,25)");
+        let c = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("alive");
+        assert_ne!(
+            c.pos.room_name(),
+            pos(0, 0).room_name(),
+            "left the start room across the east edge"
+        );
+        assert_eq!(
+            (c.pos.x().u8(), c.pos.y().u8()),
+            (0, 25),
+            "arrived at the mirror tile (0,25)"
+        );
     }
 
     #[test]
@@ -1309,14 +1481,26 @@ mod tests {
         // A creep that MOVES onto an exit tile this tick crosses the same tick (engine bulk.update
         // mutates in place → tick.js:52 sees the post-move position): (48,25) move Right → next room.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 48, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 48, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut i = Intents::new();
         i.set_move(1, Direction::Right);
         resolve_tick(&mut world, &i);
-        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
-        assert_ne!(c.pos.room_name(), pos(0, 0).room_name(), "moved to the edge AND crossed in one tick");
+        let c = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("alive");
+        assert_ne!(
+            c.pos.room_name(),
+            pos(0, 0).room_name(),
+            "moved to the edge AND crossed in one tick"
+        );
         assert_eq!((c.pos.x().u8(), c.pos.y().u8()), (0, 25));
     }
 
@@ -1324,12 +1508,20 @@ mod tests {
     fn edge_exit_skips_npc_creeps() {
         // NPC creeps (keepers/invaders) do NOT auto-exit (engine skips users '2'/'3').
         let mut world = CombatWorld {
-            creeps: vec![creep(7, 2, 49, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![creep(7, 2, 49, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            },
             ..Default::default()
         };
-        world.npc_owners.insert(2);
+        world.movement.npc_owners.insert(2);
         resolve_tick(&mut world, &Intents::new());
-        let c = world.creeps.iter().find(|c| c.id == 7).expect("alive");
+        let c = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 7)
+            .expect("alive");
         assert_eq!(c.pos, pos(49, 25), "an NPC on an exit tile stays put");
     }
 
@@ -1338,14 +1530,26 @@ mod tests {
         // A creep on an exit tile that moves INWARD (off the edge) escapes the auto-exit and stays in
         // the room (engine: tick.js:52 sees the post-move, non-edge position).
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut i = Intents::new();
         i.set_move(1, Direction::Left); // inward
         resolve_tick(&mut world, &i);
-        let c = world.creeps.iter().find(|c| c.id == 1).expect("alive");
-        assert_eq!(c.pos, pos(48, 25), "moved inward, stayed in the room, no auto-exit");
+        let c = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("alive");
+        assert_eq!(
+            c.pos,
+            pos(48, 25),
+            "moved inward, stayed in the room, no auto-exit"
+        );
     }
 
     #[test]
@@ -1356,14 +1560,45 @@ mod tests {
         // (49,25,E1N1) ↔ (0,25,E2N1) SWAP rooms — they can never converge on one tile. (The sim's historical
         // "two creeps on a tile" came from a HARNESS placement bug, `place_at_entry`'s clamp-collapse, NOT
         // from the cross — now fixed; `sim_maintains_one_creep_per_tile` in the eval guards the invariant.)
-        let p = |room: &str, x: u8, y: u8| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room.parse().unwrap());
-        let mk = |id: CreepId, pp: Position| SimCreep { id, owner: 0, pos: pp, body: SimBody::new(vec![BodyPartDef::new(Part::Move)]), fatigue: 0 };
-        let mut world = CombatWorld { creeps: vec![mk(1, p("E1N1", 49, 25)), mk(2, p("E2N1", 0, 25))], ..Default::default() };
+        let p = |room: &str, x: u8, y: u8| {
+            Position::new(
+                RoomCoordinate::new(x).unwrap(),
+                RoomCoordinate::new(y).unwrap(),
+                room.parse().unwrap(),
+            )
+        };
+        let mk = |id: CreepId, pp: Position| SimCreep {
+            id,
+            owner: 0,
+            pos: pp,
+            body: SimBody::new(vec![BodyPartDef::new(Part::Move)]),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let mut world = CombatWorld {
+            movement: MovementState {
+                creeps: vec![mk(1, p("E1N1", 49, 25)), mk(2, p("E2N1", 0, 25))],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         resolve_tick(&mut world, &Intents::new());
-        let pos_of = |id: CreepId| world.creeps.iter().find(|c| c.id == id).unwrap().pos;
+        let pos_of = |id: CreepId| {
+            world
+                .movement
+                .creeps
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap()
+                .pos
+        };
         assert_eq!(pos_of(1), p("E2N1", 0, 25), "creep 1 crossed E1N1→E2N1");
         assert_eq!(pos_of(2), p("E1N1", 49, 25), "creep 2 crossed E2N1→E1N1");
-        assert_ne!(pos_of(1), pos_of(2), "no stack — the cross is a permutation, not a collision");
+        assert_ne!(
+            pos_of(1),
+            pos_of(2),
+            "no stack — the cross is a permutation, not a collision"
+        );
     }
 
     #[test]
@@ -1373,11 +1608,24 @@ mod tests {
         // drop a creep. (We do NOT add a border collision guard: the real engine's cross is occupancy-blind,
         // global.js:34/42, and a guard would diverge from MMO. The invariant is upheld upstream by placement.)
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 49, 25, &[(Part::Move, 1)]), creep(2, 0, 49, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 49, 25, &[(Part::Move, 1)]),
+                    creep(2, 0, 49, 25, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         resolve_tick(&mut world, &Intents::new());
-        assert_eq!(world.creeps.len(), 2, "both creeps survive the border — none dropped");
-        assert_eq!(world.creeps[0].pos, world.creeps[1].pos, "the degenerate stack is transported as-is");
+        assert_eq!(
+            world.movement.creeps.len(),
+            2,
+            "both creeps survive the border — none dropped"
+        );
+        assert_eq!(
+            world.movement.creeps[0].pos, world.movement.creeps[1].pos,
+            "the degenerate stack is transported as-is"
+        );
     }
 }

@@ -14,3 +14,6 @@ description = "Deterministic, JS-free port of the Screeps combat tick — the co
 
 [dependencies]
 screeps-game-api = "0.23"
+# The shared movement/world kernel (ADR 0033): combat-engine = sim-core + the combat overlay.
+# git dep redirected to the local submodule path by the root [patch] table.
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core" }
